@@ -1,27 +1,32 @@
 use std::io::Read;
+use std::thread::sleep;
+use std::time::Duration;
 
 fn main() {
     println!("Hello, world!");
     run_macos();
+    run_windows();
 }
 
 fn run_macos() {
     println!("running on platform macos");
-    // sudo route add -net 192.168.20.0 -netmask 255.255.255.0 -interface utun2
+}
 
-    let mut config = tun::Configuration::default();
-    config
-        .address((192, 168, 20, 1))
-        .netmask((255, 255, 255, 0))
-        .up();
+fn run_windows() {
+    println!("running on platform windows");
 
-    config.platform(|config| {
-    });
+    let lib_path = "wintun.dll";
+    let wintun = unsafe { wintun::load_from_path(lib_path) }.expect("Failed to load wintun dll");
 
-    let mut dev = tun::create(&config).unwrap();
-    let mut buf = [0u8; 128];
-    loop {
-        let amount = dev.read(&mut buf).unwrap();
-        println!("{:?}", &buf[0..amount])
-    }
+    let tun_name = "rproxifier-tun";
+    let adapter = match wintun::Adapter::open(&wintun, tun_name) {
+        Ok(a) => a,
+        Err(_) => wintun::Adapter::create(&wintun, tun_name, tun_name, None)
+            .expect("Failed to create wintun adapter!"),
+    };
+
+    // TODO: setup route
+    // TODO: start read & write
+    // TODO: notice direct
+    sleep(Duration::from_secs(100))
 }
