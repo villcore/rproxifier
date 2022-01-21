@@ -9,7 +9,7 @@ fn main() {
 }
 
 fn run_macos() {
-    println!("running on platform macos");
+    println!("running on platform macos.");
 }
 
 fn run_windows() {
