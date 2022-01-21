@@ -6,5 +6,9 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-wintun = "0.2.1"
+tun = "0.5"
 smoltcp = "0.8.0"
+log = "0.4.14"
+log4rs = "1.0.0"
+async-std-resolver = "0.20.3"
+tokio = { version = "1.15.0", features = ["full"] }
