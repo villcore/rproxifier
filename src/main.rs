@@ -1,14 +1,17 @@
 use std::io::{Read, Write};
 use std::thread::sleep;
+use std::thread::spawn;
 use std::time::Duration;
-use log::{
-    info,
-    error,
-};
-use tun::Device;
 use std::process::{Command, exit};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use async_std_resolver::{resolver, config, AsyncStdResolver};
+use crate::dns::resolve::{ForwardingDnsResolver, DirectDnsResolver, UserConfigDnsWrapResolver};
+use crate::dns::server::DnsUdpServer;
+use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpPacket};
+
+use log::{info, error};
+use std::collections::HashMap;
+use crate::sys::darwin::setup_ip;
 
 fn main() {
     setup_log();
@@ -20,9 +23,17 @@ fn main() {
         .build()
         .unwrap();
 
-    // run dns server
-    run_time.block_on(start_dns_client());
+    let dns_listen = "";
+    let dns_setup = sys::darwin::DNSSetup::new(dns_listen.to_string());
 
+    // start tun_server
+    let tun_server_join_handle = spawn(|| start_tun_server());
+
+    // run dns server
+    run_time.block_on(start_user_config_dns_server());
+
+    tun_server_join_handle.join();
+    info!("Stop.");
     exit(0)
 }
 
@@ -31,37 +42,6 @@ fn setup_log() {
 }
 
 fn run_macos() {
-    info!("running on platform macos");
-
-    // let tun_name = "utun10";
-    let tun_ip = "10.0.0.1";
-    let netmask = "255.255.255.0";
-
-    let mut config = tun::Configuration::default();
-    config
-        .address(tun_ip)
-        .netmask(netmask)
-        .mtu(1500)
-        .up();
-
-    let mut device = tun::create(&config).unwrap();
-    let tun_name_str = device.name();
-    info!("Start tun {}", tun_name_str);
-
-    info!("Start sleep.");
-    sleep(Duration::from_secs(100));
-    info!("End sleep.");
-
-    // config route
-    // TODO
-
-    // start tun handle
-    let mut buf = [0u8; 2048];
-    loop {
-        let read_size = device.read(&mut buf).unwrap();
-        info!("Tun read {} size ", read_size);
-        device.write(&buf[..read_size]);
-    }
 }
 
 fn run_windows() {
@@ -73,45 +53,111 @@ fn run_windows() {
 
 fn run_linux() {}
 
-fn run_cmd(cmd: &str, args: &[&str]) {
-    let cmd_output = Command::new(cmd)
-        .args(args)
-        .output()
-        .expect(&*format!("run cmd {} failed", cmd));
+mod dns;
+mod sys;
+mod tun;
 
+async fn start_dns_server() {
+    info!("start dns server");
+    let resolver_config = config::ResolverConfig::default();
+    let resolver_opts = config::ResolverOpts::default();
+    let resolver = resolver(resolver_config, resolver_opts).await
+        .expect("failed to connect resolver");
+
+    let dns_listen = "127.0.0.1:53";
+    let direct_dns_resolver = DirectDnsResolver::new(resolver);
+    let dns_server: DnsUdpServer = dns::server::DnsUdpServer::new(
+        dns_listen.to_string(),
+        Box::new(direct_dns_resolver)
+    ).await;
+    dns_server.run_server().await;
+    info!("stop dns server");
 }
 
-pub struct DnsClient {
-    inner_resolver: AsyncStdResolver
+async fn start_user_config_dns_server() {
+    info!("start dns server");
+    let resolver_config = config::ResolverConfig::default();
+    let resolver_opts = config::ResolverOpts::default();
+    let resolver = resolver(resolver_config, resolver_opts).await
+        .expect("failed to connect resolver");
+
+    let dns_listen = "127.0.0.1:53";
+    let direct_dns_resolver = DirectDnsResolver::new(resolver);
+    let mut domain_map = HashMap::new();
+    domain_map.insert("www.bing.com".to_string(), Ipv4Addr::new(18, 0, 0, 10));
+    let user_config_dns_resolver = UserConfigDnsWrapResolver::new(domain_map, Box::new(direct_dns_resolver));
+    let dns_server: DnsUdpServer = dns::server::DnsUdpServer::new(
+        dns_listen.to_string(),
+        Box::new(user_config_dns_resolver)
+    ).await;
+    dns_server.run_server().await;
+    info!("stop dns server");
 }
 
-impl DnsClient {
+fn start_tun_server() {
+    use tun::darwin::TunSocket;
 
-    async fn new() -> Self {
+    // TODO: use common config
+    let tun_ip = "18.0.0.1";
+    let tun_cidr = "18.0.0.0/16";
+    let netmask = "255.255.255.0";
+    let tun_name = "utun9";
+    let mut tun_socket = tun::darwin::TunSocket::new(tun_name).unwrap();
 
-        let resolver = resolver(
-            config::ResolverConfig::default(),
-            config::ResolverOpts::default()).await.expect("failed to connect resolver");
+    //
+    //
+    info!("start tun {}", tun_name);
 
-        Self {
-            inner_resolver: resolver
+    // // config route
+    setup_ip(tun_name, tun_ip, tun_cidr);
+
+    //
+    // start tun handle
+    let mut buf = [0u8; 2048];
+    loop {
+        let read_size = tun_socket.read(&mut buf).unwrap();
+        if read_size == 0 {
+            log::error!("tun read error");
+            break;
         }
+
+        let mut ipv4_packet = match Ipv4Packet::new_checked(&buf[..read_size]) {
+            Ok(p) => {
+                p
+            }
+            Err(_) => {
+                tracing::error!("tun read ip_v4 packet error");
+                continue;
+            }
+        };
+
+        // modify ipv4 packet address & port
+        println!("Ip protocol = {}, src = {}, dst = {}", ipv4_packet.protocol().to_string(), ipv4_packet.src_addr(), ipv4_packet.dst_addr());
+        match ipv4_packet.protocol() {
+            IpProtocol::Tcp => {
+                let tcp_packet = TcpPacket::new_checked(ipv4_packet.payload()).unwrap();
+                log::info!("tun read tcp package from src {} src_port {} ", ipv4_packet.src_addr(), tcp_packet.src_port());
+
+                // TODO: modify
+            }
+            // IpProtocol::Udp => {
+            //
+            // }
+            other => {
+                log::error!("unsupported ipv4 protocol {} ", other);
+            }
+        }
+        // device.write(&buf[..read_size]);
     }
-
-    async fn lookup(&self, domain: &str) -> Option<IpAddr> {
-        let mut response = self.inner_resolver.lookup_ip(domain).await.unwrap();
-        response.iter().next()
-    }
 }
 
-async fn start_dns_client() {
-    let dns_client = DnsClient::new().await;
-    match dns_client.lookup("www.baidu.com").await {
-        None => {
-            info!("Get empty ip addr")
-        }
-        Some(ip_addr) => {
-            info!("Get valid ip addr {} ", ip_addr)
-        }
+#[cfg(test)]
+mod tests {
+    use crate::sys;
+
+    #[test]
+    pub fn test_dns_setup() {
+        let dns_listen = "";
+        let dns_setup = sys::darwin::DNSSetup::new(dns_listen.to_string());
     }
 }
