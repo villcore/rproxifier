@@ -5,13 +5,17 @@ use std::time::Duration;
 use std::process::{Command, exit};
 use std::net::{IpAddr, Ipv4Addr};
 use async_std_resolver::{resolver, config, AsyncStdResolver};
-use crate::dns::resolve::{ForwardingDnsResolver, DirectDnsResolver, UserConfigDnsWrapResolver};
 use crate::dns::server::DnsUdpServer;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpPacket};
 
 use log::{info, error};
 use std::collections::HashMap;
+use std::sync::Arc;
+use wintun::{Session, WintunError};
+use crate::dns::resolve::{DirectDnsResolver, UserConfigDnsWrapResolver};
 // use crate::sys::darwin::setup_ip;
+
+mod dns;
 
 fn main() {
     setup_log();
@@ -89,11 +93,49 @@ fn start_tun_server() {
     let tun_ip = "18.0.0.1";
     let tun_cidr = "18.0.0.0/16";
     let netmask = "255.255.255.0";
-    let tun_name = "utun9";
 
     //
     //
-    info!("start tun {}", tun_name);
+    // info!("start tun {}", tun_name);
+
+    let lib_path = "wintun.dll";
+    let wintun = unsafe { wintun::load_from_path(lib_path) }.expect("Failed to load wintun dll");
+
+    let tun_name = "rproxifier-tun";
+    let adapter = match wintun::Adapter::open(&wintun, tun_name) {
+        Ok(a) => a,
+        Err(_) => wintun::Adapter::create(&wintun, tun_name, tun_name, None)
+            .expect("Failed to create wintun adapter!"),
+    };
+
+    let version = wintun::get_running_driver_version(&wintun).unwrap();
+    info!("Using wintun version: {:?}", version);
+
+    let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
+    let reader_session = session.clone();
+
+    loop {
+        match reader_session.receive_blocking() {
+            Ok(packet) => {
+                let mut buf = packet.bytes();
+                match Ipv4Packet::new_checked(&buf[..]) {
+                    Ok(ipv4_packet) => {
+                        println!("Ip protocol = {}, src = {}, dst = {}", ipv4_packet.protocol().to_string(), ipv4_packet.src_addr(), ipv4_packet.dst_addr());
+                    }
+                    Err(_) => {
+                        tracing::error!("tun read ip_v4 packet error");
+                        continue;
+                    }
+                };
+            }
+            Err(_) => {
+                println!("Got error while reading packet");
+                break;
+            },
+        }
+    }
+    println!("Press enter to stop session");
+    // modify ipv4 packet address & port
 
     // // config route
     // setup_ip(tun_name, tun_ip, tun_cidr);
