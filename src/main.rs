@@ -22,6 +22,7 @@ use crate::dns::protocol::{QueryType, DnsPacket, DnsRecord, TransientTtl};
 use std::any::Any;
 use std::future::Future;
 use async_std_resolver::config::{NameServerConfigGroup, NameServerConfig, Protocol};
+use tokio::sync::mpsc::{Sender, Receiver};
 
 fn main() {
     setup_log();
@@ -272,15 +273,34 @@ fn run_tun_server(nat_session_manager: Arc<Mutex<NatSessionManager>>) {
 
 async fn run_tun_tcp_relay_server(resolver_arc: Arc<AsyncStdResolver>, fake_ip_manager: Arc<FakeIpManager>, nat_session_manager: Arc<Mutex<NatSessionManager>>, addr: &str, port: u16) {
 
+    let recycler_session_manager = nat_session_manager.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+    tokio::spawn(async move {
+        loop {
+            let recycle_session_port: Option<u16> = receiver.recv().await;
+            match recycle_session_port {
+                None => {
+                    log::info!("tun tcp relay tcp session port close recycler shutdown ");
+                    break
+                }
+                Some(session_port) => {
+                    // TODO: tun_server 检测到FIN时候进行回收
+                    let mut session_manager = recycler_session_manager.lock().unwrap();
+                    session_manager.recycle_port(session_port);
+                    log::info!("tun tcp relay tcp session recycle port {}", session_port);
+                }
+            }
+        }
+    });
+
     // bind address
-    let tcp_relay_server_addr = format!("{}:{}", addr, port);
-    match TcpListener::bind((Ipv4Addr::new(10, 0, 0, 1), 1300)).await {
+    let listen_addr = (Ipv4Addr::new(10, 0, 0, 1), 1300);
+    match TcpListener::bind(listen_addr).await {
         Ok(tcp_listener) => {
-            log::info!("======================tun tcp relay server listen {}", tcp_relay_server_addr);
-            // accept
+            log::info!("tun tcp relay server listen on {}:{}", listen_addr.0, listen_addr.1);
             while let Ok((mut tcp_socket, socket_addr)) = tcp_listener.accept().await {
                 let session_port = socket_addr.port();
-                log::info!("============================accept relay src socket {} ", socket_addr.to_string());
+                log::info!("tun tcp relay server accept relay src socket {} ", socket_addr.to_string());
                 let nat_session_read = nat_session_manager.lock().unwrap();
                 if let Some((src_addr, src_port, dst_addr, dst_port)) = nat_session_read.get_port_session_tuple(session_port) {
                     log::info!("============================ real address is {}:{} to {}:{}",
@@ -289,6 +309,7 @@ async fn run_tun_tcp_relay_server(resolver_arc: Arc<AsyncStdResolver>, fake_ip_m
 
                     let resolver_copy = resolver_arc.clone();
                     let fake_ip_manager_copy = fake_ip_manager.clone();
+                    let sender_copy = sender.clone();
                     tokio::spawn(async move {
                         let dst_addr_bytes = dst_addr.octets();
                         let real_host_port = match fake_ip_manager_copy.get_host(&(dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3])) {
@@ -329,7 +350,6 @@ async fn run_tun_tcp_relay_server(resolver_arc: Arc<AsyncStdResolver>, fake_ip_m
                         match real_host_port {
                             None => {
                                 log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                                return
                             }
                             Some((real_host, real_port)) => {
                                 // fake_id_manager
@@ -371,9 +391,9 @@ async fn run_tun_tcp_relay_server(resolver_arc: Arc<AsyncStdResolver>, fake_ip_m
                                 log::info!("******************************************************");
                             }
                         }
+                        sender_copy.send(session_port).await;
                     });
                 }
-
             }
         }
 
@@ -429,14 +449,10 @@ impl NatSessionManager {
         }
     }
 
+    /// 回收端口
     pub fn recycle_port(&mut self, port: u16) {
         let mut inner = self.inner.lock().unwrap();
         inner.recycle_port(port);
-    }
-
-    // TODO: use channel monitor
-    pub fn start_recycle_monitor() {
-
     }
 }
 
