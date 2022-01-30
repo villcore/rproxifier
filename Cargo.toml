@@ -6,7 +6,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-smoltcp = { version = "0.6.0", default-features = false, features = ["proto-ipv6", "proto-ipv4", "std"] }
+smoltcp = { version = "0.8.0", default-features = false, features = ["proto-ipv6", "proto-ipv4", "std"] }
 log = "0.4.14"
 log4rs = "1.0.0"
 async-trait = "0.1.36"
@@ -19,3 +19,6 @@ async-std-resolver = "0.21.0-alpha.4"
 trust-dns-proto = { version = "0.21.0-alpha.4", default-features = false }
 tokio = { version = "1.15.0", features = ["full"] }
 libc = "0.2.74"
+bytes = "1.1.0"
+dashmap = "5.0.0"
+anyhow = "1.0.53"

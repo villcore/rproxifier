@@ -16,8 +16,14 @@ use async_std_resolver::lookup_ip::LookupIp;
 use std::io;
 use trust_dns_proto::rr::{RData, Record};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, IpAddr, SocketAddr};
 use std::borrow::BorrowMut;
+use dashmap::DashMap;
+use std::collections::hash_map::RandomState;
+use dashmap::mapref::one::Ref;
+use std::sync::atomic::{Ordering, AtomicU32};
+use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
 
 #[async_trait]
 pub trait DnsResolver {
@@ -316,22 +322,67 @@ impl DnsResolver for DirectDnsResolver {
     }
 }
 
-pub struct UserConfigDnsWrapResolver {
+pub enum UserConfigDnsType {
+
+    /// 正则表达式，模糊匹配
+    Regex(String, RelayPolicy),
+
+    /// 普通文本，精确匹配
+    PlanText(String, RelayPolicy),
+
+    /// 包含匹配
+    ContainsText(String, RelayPolicy),
+
+    /// 默认规则，以上规则无法命中时默认规则
+    Default(RelayPolicy)
+}
+
+/// 转发策略
+pub enum RelayPolicy {
+
+    /// 直接连接
+    Direct,
+
+    /// 代理连接
+    Proxy(Ipv4Addr, u16),
+
+    ///
+
+    /// 拒绝访问
+    Reject,
+
+    /// 探测
+    Probe(Box<RelayPolicy>)
+}
+
+pub struct UserConfigDnsResolver {
     domain_map: HashMap<String, Ipv4Addr>,
+    ip_addr_map: HashMap<Ipv4Addr, String>,
     wrap_resolver:  Box<dyn DnsResolver + Sync + Send>
 }
 
-impl UserConfigDnsWrapResolver {
-    pub fn new(domain_map: HashMap<String, Ipv4Addr>, mut wrap_resolver: Box<dyn DnsResolver + Sync + Send>) -> Self {
+impl UserConfigDnsResolver {
+
+    pub fn new(mut wrap_resolver: Box<dyn DnsResolver + Sync + Send>) -> Self {
         Self {
-            domain_map,
+            domain_map: HashMap::new(),
+            ip_addr_map: HashMap::new(),
             wrap_resolver
         }
+    }
+
+    pub fn get_host(&self, ip: &Ipv4Addr) -> Option<&String> {
+        self.ip_addr_map.get(ip)
+    }
+
+    pub fn add_domain_addr(&mut self, host: String, ip: Ipv4Addr) {
+        self.domain_map.insert(host.clone(), ip);
+        self.ip_addr_map.insert(ip, host.clone());
     }
 }
 
 #[async_trait]
-impl DnsResolver for UserConfigDnsWrapResolver {
+impl DnsResolver for UserConfigDnsResolver {
     async fn resolve(&self, qname: &str, qtype: QueryType, recursive: bool) -> Result<DnsPacket> {
         log::info!(">>>> {:?}", self.domain_map);
         match self.domain_map.get(qname) {
@@ -352,10 +403,236 @@ impl DnsResolver for UserConfigDnsWrapResolver {
             }
         }
     }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// fake_ip_manager
+pub struct FakeIpManager {
+    inner: Arc<Mutex<InnerFakeIpManager>>
+}
+
+impl FakeIpManager {
+
+    pub fn new(start_ip: (u8, u8, u8, u8)) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(InnerFakeIpManager::new(start_ip)))
+        }
+    }
+
+    pub fn get_or_create_fake_ip(&self, host: &str) -> Option<(u8, u8, u8, u8)> {
+        let inner_write = self.inner.lock().unwrap();
+        if let Some(fake_ip) = inner_write.get_fake_ip(host) {
+            return Some(fake_ip)
+        }
+
+        // let mut inner_write = self.inner.write().await;
+        match inner_write.get_fake_ip(host) {
+            Some(fake_ip) => {
+                return Some(fake_ip)
+            }
+            None => {
+                Some(inner_write.create_fake_ip(host))
+            }
+        }
+    }
+
+    pub fn get_host(&self, fake_ip: &(u8, u8, u8, u8)) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        match inner.get_host(fake_ip) {
+            None => None,
+            Some(host) => {
+                Some(host.to_owned())
+            }
+        }
+    }
+}
+
+pub struct InnerFakeIpManager {
+    host_to_fake_ip: DashMap<String, (u8, u8, u8, u8)>,
+    fake_ip_to_host: DashMap<(u8, u8, u8, u8), String>,
+    next_fake_ip_seq: AtomicU32,
+}
+
+impl InnerFakeIpManager {
+
+    pub fn new(start_ip: (u8, u8, u8, u8)) -> Self {
+        let mut b = [0u8; 4];
+        b[0] = start_ip.0;
+        b[1] = start_ip.1;
+        b[2] = start_ip.2;
+        b[3] = start_ip.3;
+        let next_fake_ip_seq: u32 = u32::from_be_bytes(b);
+        Self {
+            host_to_fake_ip: DashMap::with_capacity(1024),
+            fake_ip_to_host: DashMap::with_capacity(1024),
+            next_fake_ip_seq: AtomicU32::new(next_fake_ip_seq)
+        }
+    }
+
+    pub fn get_host(&self, fake_ip: &(u8, u8, u8, u8)) -> Option<String> {
+        match self.fake_ip_to_host.get(fake_ip) {
+            None => None,
+            Some(result) => {
+                Some(result.value().to_owned())
+            }
+        }
+    }
+
+    fn get_fake_ip(&self, host: &str) -> Option<(u8, u8, u8, u8)> {
+        match self.host_to_fake_ip.get(host) {
+            None => None,
+            Some(result) => {
+                Some(result.value().to_owned())
+            }
+        }
+    }
+
+    fn create_fake_ip(&self, host: &str) -> (u8, u8, u8, u8) {
+        let next_fake_ip = self.next_fake_ip();
+        self.host_to_fake_ip.insert(host.to_string(), next_fake_ip);
+        self.fake_ip_to_host.insert(next_fake_ip, host.to_string());
+        next_fake_ip
+    }
+
+    fn next_fake_ip(&self) -> (u8, u8, u8, u8) {
+        // FIXME: range exceed
+        let next_fake_ip_seq = self.next_fake_ip_seq.load(Ordering::SeqCst);
+        self.next_fake_ip_seq.fetch_add(1, Ordering::SeqCst);
+        let a = next_fake_ip_seq.to_be_bytes();
+        (a[0], a[1], a[2], a[3])
+    }
+
+    fn remove_host(&mut self) {
+        todo!()
+    }
+
+    fn clear_all(&mut self) {
+        todo!()
+    }
+}
+
+pub struct ConfigDnsResolver {
+    fake_ip_manager: Arc<FakeIpManager>,
+    async_std_resolver: AsyncStdResolver
+}
+
+impl ConfigDnsResolver {
+
+    pub fn new(fake_ip_manager: Arc<FakeIpManager>, async_std_resolver: AsyncStdResolver) -> Self {
+        Self {
+            fake_ip_manager,
+            async_std_resolver
+        }
+    }
+
+    pub async fn get_or_create_fake_ip(&self, host: &str) -> Option<(u8, u8, u8, u8)> {
+        self.fake_ip_manager.clone().get_or_create_fake_ip(host)
+    }
+
+    pub async fn get_host(&mut self, ip_addr: &Ipv4Addr) -> Option<String> {
+        let bytes = ip_addr.octets();
+        let ip: (u8, u8, u8, u8) = (bytes[0], bytes[1], bytes[2], bytes[3]);
+        self.fake_ip_manager.clone().get_host(&ip)
+    }
+
+    pub async fn resolve_host(&self, qname: &str) -> Result<DnsPacket> {
+        match self.async_std_resolver.lookup_ip(qname).await {
+            Ok(lookup_result) => {
+                let mut dns_records: Vec<DnsRecord> = lookup_result.as_lookup().record_iter()
+                    .map(|r| {
+                        let rd = r.rdata();
+                        match rd {
+                            RData::A(ip) => {
+                                DnsRecord::A {
+                                    domain: qname.to_string(),
+                                    addr: *ip,
+                                    ttl: TransientTtl(r.ttl()),
+                                }
+                            }
+
+                            RData::AAAA(ip) => {
+                                DnsRecord::AAAA {
+                                    domain: qname.to_string(),
+                                    addr: *ip,
+                                    ttl: TransientTtl(r.ttl()),
+                                }
+                            }
+                            _ => {
+                                DnsRecord::UNKNOWN {
+                                    domain: qname.to_string(),
+                                    qtype: 0,
+                                    data_len: 0,
+                                    ttl: TransientTtl(r.ttl()),
+                                }
+                            }
+                        }
+                    })
+                    .filter(|dns_record| {
+                        match dns_record {
+                            DnsRecord::UNKNOWN { .. } => {
+                                false
+                            }
+                            _ => {
+                                true
+                            }
+                        }
+                    })
+                    .collect();
+                let mut dns_packet = DnsPacket::new();
+                dns_packet.answers.append(&mut dns_records);
+                Ok(dns_packet)
+            }
+
+            Err(e) => {
+                tracing::error!("!!! Resolve host [{}] error, msg: {} ", qname, e.to_string());
+                Err(io::Error::new(io::ErrorKind::Other, e))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl DnsResolver for ConfigDnsResolver {
+    async fn resolve(&self, qname: &str, qtype: QueryType, recursive: bool) -> Result<DnsPacket> {
+        println!("----------------------------");
+        match self.get_or_create_fake_ip(qname).await {
+            Some((a, b, c, d)) => {
+                println!(">>>>>>>>>>>>");
+                let dns_answer = DnsRecord::A {
+                    domain: qname.to_string(),
+                    addr: Ipv4Addr::new(a, b, c, d),
+                    ttl: TransientTtl(60),
+                };
+
+                let mut dns_packet = DnsPacket::new();
+                dns_packet.answers.push(dns_answer);
+                Ok(dns_packet)
+            }
+
+            None => {
+                println!("xxxxxxxxx");
+                self.resolve_host(qname).await
+            }
+        }
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+pub async fn resolve_host(async_std_resolver: Arc<AsyncStdResolver>, domain: &str) -> Result<IpAddr> {
+    let response = async_std_resolver
+        .lookup_ip(domain)
+        .await
+        .map_err(|_| Error::new(ErrorKind::NotFound, format!("{} not resolved", domain)))?;
+
+    response
+        .iter()
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("{} not resolved", domain)))
 }
 
 #[cfg(test)]
