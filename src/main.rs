@@ -451,8 +451,8 @@ impl NatSessionManager {
 
     /// 回收端口
     pub fn recycle_port(&mut self, port: u16) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.recycle_port(port);
+        // let mut inner = self.inner.lock().unwrap();
+        // inner.recycle_port(port);
     }
 }
 
