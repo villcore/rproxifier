@@ -271,6 +271,7 @@ fn run_tun_server(nat_session_manager: Arc<Mutex<NatSessionManager>>) {
     }
 }
 
+/// tcp relay server
 async fn run_tun_tcp_relay_server(resolver_arc: Arc<AsyncStdResolver>, fake_ip_manager: Arc<FakeIpManager>, nat_session_manager: Arc<Mutex<NatSessionManager>>, addr: &str, port: u16) {
 
     let recycler_session_manager = nat_session_manager.clone();
@@ -403,6 +404,11 @@ async fn run_tun_tcp_relay_server(resolver_arc: Arc<AsyncStdResolver>, fake_ip_m
     }
 }
 
+/// upd relay server
+async fn run_tun_udp_relay_server() {
+
+}
+
 pub struct NatSessionManager {
     pub inner: Arc<Mutex<InnerNatSessionManager>>,
 }
@@ -451,8 +457,8 @@ impl NatSessionManager {
 
     /// 回收端口
     pub fn recycle_port(&mut self, port: u16) {
-        // let mut inner = self.inner.lock().unwrap();
-        // inner.recycle_port(port);
+        let mut inner = self.inner.lock().unwrap();
+        inner.recycle_port(port);
     }
 }
 
