@@ -11,7 +11,7 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpP
 
 use log::{info, error};
 use std::collections::{HashMap, LinkedList};
-use crate::sys::darwin::setup_ip;
+use crate::sys::darwin::{setup_ip, set_rlimit};
 use smoltcp::Error;
 use tokio::net::{TcpStream, TcpListener};
 use std::sync::{Arc, RwLock, Mutex};
@@ -24,36 +24,74 @@ use std::future::Future;
 use async_std_resolver::config::{NameServerConfigGroup, NameServerConfig, Protocol};
 use tokio::sync::mpsc::{Sender, Receiver};
 
+use fltk::{app, prelude::*, window::Window, button};
+use fltk::enums::{FrameType, Color, Align};
+
 fn main() {
+
     setup_log();
 
-    // TODO construct config
-    // TODO start_server_with_config
-    info!("Hello, world!");
+    let app = app::App::default();
+    let mut wind = Window::default()
+        .with_size(350, 450)
+        .with_label("rproxifier");
 
-    let nat_session_manager = Arc::new(Mutex::new(NatSessionManager::new(10000)));
+    let mut btn_start_run = button::ToggleButton::new(135, 60, 80, 20, "@+9circle")
+        .with_align(Align::Left | Align::Inside);
 
-    let run_time = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    wind.end();
+    wind.show();
+
+    btn_start_run.set_frame(FrameType::RFlatBox);
+    btn_start_run.set_label_color(Color::White);
+    btn_start_run.set_selection_color(Color::from_u32(0x70DB93));
+    btn_start_run.set_color(Color::from_u32(0x585858));
+    btn_start_run.clear_visible_focus();
 
     let dns_listen = "";
-    let _dns_setup = sys::darwin::DNSSetup::new(dns_listen.to_string());
+    let mut dns_setup = sys::darwin::DNSSetup::new(dns_listen.to_string());
+    btn_start_run.set_callback(move |t| {
+        if t.is_set() {
+            t.set_align(Align::Right | Align::Inside);
+            log::info!("start run");
+            dns_setup.set_dns();
+        } else {
+            t.set_align(Align::Left | Align::Inside);
+            log::info!("stop run");
+            dns_setup.clear_dns();
+        }
+        t.parent().unwrap().redraw();
+    });
 
-    // start tun_server
-    let tun_session_manager = nat_session_manager.clone();
-    let tun_server_join_handle = spawn(move || run_tun_server(tun_session_manager));
+    spawn(|| {
+        // TODO construct config
+        // TODO start_server_with_config
+        info!("Hello, world!");
+        set_rlimit(65535);
+        let nat_session_manager = Arc::new(Mutex::new(NatSessionManager::new(10000)));
 
-    // start tun_relay_server
+        let run_time = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-    // TODO: remove this.
-    sleep(Duration::from_secs(5));
+        // start tun_server
+        let tun_session_manager = nat_session_manager.clone();
+        let tun_server_join_handle = spawn(move || run_tun_server(tun_session_manager));
 
-    let relay_server_session_manager = nat_session_manager.clone();
-    run_time.block_on(start(relay_server_session_manager));
+        // start tun_relay_server
 
-    tun_server_join_handle.join();
+        // TODO: remove this.
+        sleep(Duration::from_secs(5));
+
+        let relay_server_session_manager = nat_session_manager.clone();
+        run_time.block_on(start(relay_server_session_manager));
+        info!("Runtime stop.");
+
+        tun_server_join_handle.join();
+    });
+
+    app.run().unwrap();
     info!("Stop.");
     exit(0)
 }
@@ -303,68 +341,82 @@ async fn run_tun_tcp_relay_server(resolver_arc: Arc<AsyncStdResolver>, fake_ip_m
                 let session_port = socket_addr.port();
                 log::info!("tun tcp relay server accept relay src socket {} ", socket_addr.to_string());
                 let nat_session_read = nat_session_manager.lock().unwrap();
-                if let Some((src_addr, src_port, dst_addr, dst_port)) = nat_session_read.get_port_session_tuple(session_port) {
-                    log::info!("============================ real address is {}:{} to {}:{}",
-                        src_addr, src_port, dst_addr, dst_port
-                    );
+                match nat_session_read.get_port_session_tuple(session_port) {
+                    None => {
+                        log::warn!("invalid session port {}", session_port);
+                        sender.send(session_port);
+                    }
+                    Some((src_addr, src_port, dst_addr, dst_port)) => {
+                        log::info!("============================ real address is {}:{} to {}:{}",
+                                   src_addr, src_port, dst_addr, dst_port
+                        );
 
-                    let resolver_copy = resolver_arc.clone();
-                    let fake_ip_manager_copy = fake_ip_manager.clone();
-                    let sender_copy = sender.clone();
-                    tokio::spawn(async move {
-                        let dst_addr_bytes = dst_addr.octets();
-                        let real_host_port = match fake_ip_manager_copy.get_host(&(dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3])) {
-                            None => {
-                                log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                                None
-                            }
+                        let sender_copy = sender.clone();
+                        let resolver_copy = resolver_arc.clone();
+                        let fake_ip_manager_copy = fake_ip_manager.clone();
+                        tokio::spawn(async move {
+                            let dst_addr_bytes = dst_addr.octets();
+                            let real_host_port = match fake_ip_manager_copy.get_host(&(dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3])) {
+                                None => {
+                                    log::error!("get host from fake_ip {} error", dst_addr.to_string());
+                                    None
+                                }
 
-                            Some(host) => {
-                                log::info!("get host from fake_ip {} success, host {}", dst_addr.to_string(), host);
+                                Some(host) => {
+                                    log::info!("get host from fake_ip {} success, host {}", dst_addr.to_string(), host);
 
-                                let mut host_splits: Vec<&str> = host.split(".").collect();
-                                let host_num_splits: Vec<u8> = host_splits.iter()
-                                    .map(|s| s.parse::<u8>())
-                                    .filter(|r| r.is_ok())
-                                    .map(|r| r.unwrap())
-                                    .collect();
+                                    let mut host_splits: Vec<&str> = host.split(".").collect();
+                                    let host_num_splits: Vec<u8> = host_splits.iter()
+                                        .map(|s| s.parse::<u8>())
+                                        .filter(|r| r.is_ok())
+                                        .map(|r| r.unwrap())
+                                        .collect();
 
-                                let host_split_len = host_splits.len();
-                                if host_split_len == 4 && host_num_splits.len() == host_split_len {
-                                    // 如果是点号ip地址格式，选择直接连接
-                                    Some((host, dst_port))
-                                } else {
-                                    // 如果是字符串host格式，需要dns解析
-                                    match resolve_host(resolver_copy, &host).await {
-                                        Ok(ipv4_addr) => {
-                                            Some((ipv4_addr.to_string(), dst_port))
-                                        }
-                                        Err(_) => {
-                                            log::error!("resolve host {} error", host);
-                                            None
+                                    let host_split_len = host_splits.len();
+                                    if host_split_len == 4 && host_num_splits.len() == host_split_len {
+                                        // 如果是点号ip地址格式，选择直接连接
+                                        Some((host, dst_port))
+                                    } else {
+                                        // 如果是字符串host格式，需要dns解析
+                                        match resolve_host(resolver_copy, &host).await {
+                                            Ok(ipv4_addr) => {
+                                                Some((ipv4_addr.to_string(), dst_port))
+                                            }
+                                            Err(_) => {
+                                                log::error!("resolve host {} error", host);
+                                                None
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        };
+                            };
 
-                        match real_host_port {
-                            None => {
-                                log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                            }
-                            Some((real_host, real_port)) => {
-                                // fake_id_manager
-                                log::info!("======================================================== real_addr {}:{}", real_host, real_port);
-                                let (mut src_read, mut src_write) = tcp_socket.split();
+                            match real_host_port {
+                                None => {
+                                    log::error!("get host from fake_ip {} error", dst_addr.to_string());
+                                }
+                                Some((real_host, real_port)) => {
+                                    let (host, port) = (real_host.as_str(), real_port);
+                                    let (mut src_read, mut src_write) = tcp_socket.split();
+                                    let mut dst_socket = match TcpStream::connect((host, port)).await {
+                                        Ok(dst_socket) => {
+                                            log::info!("session {} => connect real_addr {}:{}", session_port, host, port);
+                                            dst_socket
+                                        }
+                                        Err(errors) => {
+                                            log::error!("session {} => connect real addr {}:{} error, {}", session_port, host, port, errors);
+                                            sender_copy.send(session_port).await;
+                                            return
+                                        }
+                                    };
 
-                                let mut dst_socket = TcpStream::connect((real_host, real_port)).await.unwrap();
-                                let (mut dst_read, mut dst_write) = dst_socket.split();
+                                    let (mut dst_read, mut dst_write) = dst_socket.split();
 
-                                let mut src_to_dst_buf = BytesMut::with_capacity(4096);
-                                let mut dst_to_src_buf = BytesMut::with_capacity(4096);
+                                    let mut src_to_dst_buf = BytesMut::with_capacity(4096);
+                                    let mut dst_to_src_buf = BytesMut::with_capacity(4096);
 
-                                loop {
-                                    tokio::select! {
+                                    loop {
+                                        tokio::select! {
                                         read_size = src_read.read_buf(&mut src_to_dst_buf) => {
                                             let size = read_size.unwrap() as usize;
                                             if size <= 0 {
@@ -388,12 +440,13 @@ async fn run_tun_tcp_relay_server(resolver_arc: Arc<AsyncStdResolver>, fake_ip_m
                                             // log::info!("src write >>>>> {}", size);
                                         }
                                     }
+                                    }
+                                    log::info!("******************************************************");
                                 }
-                                log::info!("******************************************************");
                             }
-                        }
-                        sender_copy.send(session_port).await;
-                    });
+                            sender_copy.send(session_port).await;
+                        });
+                    }
                 }
             }
         }
@@ -472,9 +525,17 @@ pub struct InnerNatSessionManager {
 impl InnerNatSessionManager {
 
     pub fn next_port(&mut self) -> u16 {
+        log::info!("current recycle port queue count {}", self.recycle_port_list.len());
         return match self.get_recycle_port() {
-            None => self.calculate_next_port(),
-            Some(port) => port
+            None => {
+                let port = self.calculate_next_port();
+                log::info!("get new calculate next port {}", port);
+                port
+            },
+            Some(port) => {
+                log::info!("get available recycle port {}", port);
+                port
+            }
         };
     }
 
@@ -492,6 +553,8 @@ impl InnerNatSessionManager {
         if let Some((src_addr, src_port, dst_addr, dst_port)) = self.session_port_to_addr.get(&port) {
             self.session_addr_to_port.remove(&(*src_addr, *src_port, *dst_addr, *dst_port,));
             self.session_port_to_addr.remove(&port);
+            self.recycle_port_list.push_back(port);
+            log::info!("=================available recycle port count {}", self.recycle_port_list.len());
         }
     }
 }
