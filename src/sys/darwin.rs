@@ -17,7 +17,7 @@ impl DNSSetup {
         }
     }
 
-    pub fn set_dns(&mut self) {
+    pub fn set_dns(&self) {
         let network = get_primary_network();
         let original_dns = get_original_dns(&self.dns_listen);
         if !original_dns.is_empty() {
@@ -58,7 +58,7 @@ impl Drop for DNSSetup {
     }
 }
 
-pub fn setup_ip(tun_name: &str, ip: &str, cidr: &str) {
+pub fn setup_ip_route(tun_name: &str, ip: &str, cidr: &str) {
     let _ = run_cmd("ifconfig", &[tun_name, ip, ip]);
     let _ = run_cmd("route", &["add", cidr, ip]);
 }

@@ -596,10 +596,8 @@ impl ConfigDnsResolver {
 #[async_trait]
 impl DnsResolver for ConfigDnsResolver {
     async fn resolve(&self, qname: &str, qtype: QueryType, recursive: bool) -> Result<DnsPacket> {
-        println!("----------------------------");
         match self.get_or_create_fake_ip(qname).await {
             Some((a, b, c, d)) => {
-                println!(">>>>>>>>>>>>");
                 let dns_answer = DnsRecord::A {
                     domain: qname.to_string(),
                     addr: Ipv4Addr::new(a, b, c, d),
@@ -612,7 +610,6 @@ impl DnsResolver for ConfigDnsResolver {
             }
 
             None => {
-                println!("xxxxxxxxx");
                 self.resolve_host(qname).await
             }
         }
