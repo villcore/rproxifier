@@ -11,8 +11,11 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpP
 
 use log::{info, error, Level};
 use std::collections::{HashMap, LinkedList};
-use crate::sys::darwin::{setup_ip_route, set_rlimit, DNSSetup};
+#[cfg(target_os="macos")]
+use crate::sys::sys::{setup_ip_route, set_rlimit, DNSSetup};
+use crate::sys::sys::{DNSSetup};
 use smoltcp::Error;
+#[cfg(target_os="macos")]
 use tun::darwin::TunSocket;
 use tokio::net::{TcpStream, TcpListener};
 use std::sync::{Arc, RwLock, Mutex, PoisonError, MutexGuard};
@@ -56,13 +59,16 @@ fn main() {
     spawn(move || background_network.run());
 
     // setup gui
-    let app = App::new(network.clone());
-    let options = eframe::NativeOptions {
-        transparent: true,
-        drag_and_drop_support: true,
-        ..Default::default()
-    };
-    eframe::run_native(Box::new(app), options);
+    // let app = App::new(network.clone());
+    // let options = eframe::NativeOptions {
+    //     transparent: true,
+    //     drag_and_drop_support: true,
+    //     ..Default::default()
+    // };
+    // eframe::run_native(Box::new(app), options);
+
+    network.setup_dns();
+    sleep(Duration::from_secs(10000));
 }
 
 fn setup_log() {
@@ -323,7 +329,7 @@ impl NetworkModule {
         Self {
             // TODO: windows
             dns_listen: dns_listen.to_string(),
-            dns_setup: sys::darwin::DNSSetup::new(dns_listen.to_string()),
+            dns_setup: sys::sys::DNSSetup::new(dns_listen.to_string()),
             nat_session_manager: Arc::new(Mutex::new(NatSessionManager::new(net_session_begin_port))),
             host_route_manager: Arc::new(Default::default()),
             fake_ip_manager: Arc::new(FakeIpManager::new((10, 0, 0, 100)))
@@ -347,6 +353,7 @@ impl NetworkModule {
         self.dns_setup.clear_dns();
     }
 
+    #[cfg(target_os="macos")]
     pub fn set_rlimit(&self, limit: u64) {
         set_rlimit(limit);
     }
@@ -356,6 +363,7 @@ impl NetworkModule {
     }
 
     pub fn run(&self) {
+        #[cfg(target_os="macos")]
         self.set_rlimit(30000);
         let nat_session_manager = self.nat_session_manager.clone();
         let fake_ip_manager = self.fake_ip_manager.clone();
@@ -364,7 +372,7 @@ impl NetworkModule {
         // start tun_server
         let (stared_event_sender, mut stared_event_receiver) = std::sync::mpsc::channel();
         self.run_sync_component(nat_session_manager.clone(), stared_event_sender);
-        match stared_event_receiver.recv_timeout(Duration::from_secs(5)) {
+        match stared_event_receiver.recv_timeout(Duration::from_secs(10)) {
             Ok(stared) => {
                 log::info!("network sync component stared")
             }
@@ -441,6 +449,7 @@ impl NetworkModule {
                 protocol: Protocol::Udp,
                 tls_dns_name: None,
                 trust_nx_responses: false,
+                bind_addr: None
             }
         );
 
@@ -450,6 +459,7 @@ impl NetworkModule {
                 protocol: Protocol::Udp,
                 tls_dns_name: None,
                 trust_nx_responses: false,
+                bind_addr: None
             }
         );
 
@@ -459,6 +469,7 @@ impl NetworkModule {
                 protocol: Protocol::Tcp,
                 tls_dns_name: None,
                 trust_nx_responses: false,
+                bind_addr: None
             }
         );
         return config::ResolverConfig::from_parts(None, Vec::new(), name_server_config_group);
@@ -510,6 +521,8 @@ impl TunServer {
     }
 
     pub fn run_tun_server_inner(&mut self, stared_event_sender: std::sync::mpsc::Sender<bool>) {
+
+        #[cfg(target_os="macos")]
         let mut tun_socket = match tun::darwin::TunSocket::new(&self.tun_name) {
             Ok(tun_socket) => tun_socket,
             Err(error) => {
@@ -517,9 +530,23 @@ impl TunServer {
                 return;
             }
         };
+        #[cfg(target_os="macos")]
         setup_ip_route(&self.tun_name, &self.tun_ip, &self.tun_cidr);
-        stared_event_sender.send(true);
 
+        #[cfg(target_os="windows")]
+        let mut tun_socket = match tun::windows::TunSocket::new("rproxifier-tun") {
+            Ok(tun_socket) => tun_socket,
+            Err(error) => {
+                log::error!("create windows tun error, {}", error.to_string());
+                return;
+            }
+        };
+
+        // windows sleep for a while
+        #[cfg(target_os="windows")]
+        sleep(Duration::from_secs(5));
+
+        stared_event_sender.send(true);
         let relay_addr = self.relay_addr;
         let relay_port = self.relay_port;
         self.run_ip_packet_transfer(tun_socket, relay_addr, relay_port);
@@ -541,7 +568,7 @@ impl TunServer {
         where T: Read + Write {
 
         let nat_session_manager = self.nat_session_manager.clone();
-        let mut socket_buf = [0u8; 4096];
+        let mut socket_buf = [0u8; u16::MAX as usize];
         let mut ipv4_packet = match self.read_ipv4_packet(&mut tun_socket, &mut socket_buf) {
             Ok(packet) => packet,
             Err(errors) => return Err(anyhow::anyhow!("tun not supported udp"))
@@ -741,7 +768,7 @@ impl TcpRelayServer {
                     };
 
                     let rule_strategy = match host_route_manager.get_route_strategy(&origin_host_port.0) {
-                        None => &HostRouteStrategy::Direct,
+                        None => HostRouteStrategy::Direct,
                         Some(strategy) => strategy
                     };
 
@@ -773,7 +800,7 @@ impl TcpRelayServer {
                         HostRouteStrategy::Proxy(addr, port, direct_ip, last_update_time) => {
                             // host_route_manager
                             // TODO: dns_lookup cache.
-                            let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &*addr, *port).await {
+                            let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &addr, port).await {
                                 None => {
                                     return
                                 },
@@ -787,7 +814,7 @@ impl TcpRelayServer {
                         }
 
                         HostRouteStrategy::Probe(tested, need_proxy, addr, port, direct_ip, last_update_time) => {
-                            let mut need_proxy = *need_proxy;
+                            let mut need_proxy = need_proxy;
                             let (dst_socket, direct_connected) = if !tested {
                                 let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy.clone(), fake_ip_manager).await {
                                     None => None,
@@ -837,7 +864,7 @@ impl TcpRelayServer {
                                 stream_pipe.pipe_loop().await
                             } else {
                                 // proxy
-                                let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &*addr, *port).await {
+                                let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &addr, port).await {
                                     None => {
                                         return
                                     },
@@ -994,10 +1021,10 @@ impl HostRouteManager {
         }
     }
 
-    pub fn get_route_strategy(&self, host: &str) -> Option<(&HostRouteStrategy)> {
+    pub fn get_route_strategy(&self, host: &str) -> Option<(HostRouteStrategy)> {
         match self.host_route_strategy.get(host) {
             Some(kv_ref) => return {
-                Some(kv_ref.value())
+                Some(kv_ref.value().get_copy())
             },
             None => {}
         }
@@ -1013,9 +1040,9 @@ impl HostRouteManager {
 
         return match self.host_route_strategy.get(host) {
             Some(kv_ref) => {
-                Some(kv_ref.value())
+                Some(kv_ref.value().get_copy())
             },
-            None => Some(&HostRouteStrategy::Direct)
+            None => Some(HostRouteStrategy::Direct)
         }
     }
 

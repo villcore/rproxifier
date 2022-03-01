@@ -18,37 +18,52 @@ impl DNSSetup {
     }
 
     pub fn set_dns(&self) {
-        let network = get_primary_network();
-        let original_dns = get_original_dns(&self.dns_listen);
-        if !original_dns.is_empty() {
-            let mut args = vec!["-setdnsservers", &network, "127.0.0.1"];
-            for dns in original_dns {
-                args.push(&self.dns_listen);
+        if cfg!(target_os="macos") {
+            let network = get_primary_network();
+            let original_dns = get_original_dns(&self.dns_listen);
+            if !original_dns.is_empty() {
+                let mut args = vec!["-setdnsservers", &network, "127.0.0.1"];
+                for dns in original_dns {
+                    args.push(&self.dns_listen);
+                }
+                let _ = run_cmd("networksetup", &args);
+            } else if self.dns_listen.is_empty() {
+                let _ = run_cmd("networksetup", &["-setdnsservers", &network, "127.0.0.1"]);
+            } else {
+                let _ = run_cmd(
+                    "networksetup",
+                    &["-setdnsservers", &network, "127.0.0.1", &self.dns_listen],
+                );
             }
-            let _ = run_cmd("networksetup", &args);
-        } else if self.dns_listen.is_empty() {
-            let _ = run_cmd("networksetup", &["-setdnsservers", &network, "127.0.0.1"]);
         } else {
-            let _ = run_cmd(
-                "networksetup",
-                &["-setdnsservers", &network, "127.0.0.1", &self.dns_listen],
-            );
+            // match interfaces::Interface::get_all() {
+            //     Ok(interface_vec) => {
+            //         for i in interface_vec {
+            //             log::info!("<<<<<<<<<<<<<<<<<<<<<<<<<<< {}", i.name)
+            //         }
+            //     }
+            //     Err(_) => {}
+            // }
         }
     }
 
     pub fn clear_dns(&self) {
-        let network = get_primary_network();
-        let original_dns = get_original_dns(&self.dns_listen);
-        let mut args = vec!["-setdnsservers", &network];
-        if original_dns.is_empty() {
-            args.push("empty");
+        if cfg!(target_os="macos") {
+            let network = get_primary_network();
+            let original_dns = get_original_dns(&self.dns_listen);
+            let mut args = vec!["-setdnsservers", &network];
+            if original_dns.is_empty() {
+                args.push("empty");
+            } else {
+                for dns in &original_dns {
+                    args.push(dns);
+                }
+            };
+            info!("Restore original DNS: {:?}", original_dns);
+            let _ = run_cmd("networksetup", &args);
         } else {
-            for dns in &original_dns {
-                args.push(dns);
-            }
-        };
-        info!("Restore original DNS: {:?}", original_dns);
-        let _ = run_cmd("networksetup", &args);
+            // TODO: windows
+        }
     }
 }
 
@@ -59,8 +74,12 @@ impl Drop for DNSSetup {
 }
 
 pub fn setup_ip_route(tun_name: &str, ip: &str, cidr: &str) {
-    let _ = run_cmd("ifconfig", &[tun_name, ip, ip]);
-    let _ = run_cmd("route", &["add", cidr, ip]);
+    if cfg!(target_os="macos") {
+        let _ = run_cmd("ifconfig", &[tun_name, ip, ip]);
+        let _ = run_cmd("route", &["add", cidr, ip]);
+    } else {
+        // TODO: windows
+    }
 }
 
 fn get_primary_network() -> String {
@@ -124,15 +143,16 @@ pub fn run_cmd(cmd: &str, args: &[&str]) -> String {
         .to_string()
 }
 
+#[cfg(target_os="macos")]
 pub fn set_rlimit(limit: u64) -> anyhow::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: limit,
-        rlim_max: limit,
-    };
+        let limit = libc::rlimit {
+            rlim_cur: limit,
+            rlim_max: limit,
+        };
 
-    let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
-    if ret == -1 {
-        return Err(anyhow!("set rlimt file error"));
-    }
-    Ok(())
+        let ret = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        if ret == -1 {
+            return Err(anyhow!("set rlimt file error"));
+        }
+        Ok(())
 }
