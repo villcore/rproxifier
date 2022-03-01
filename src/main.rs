@@ -50,7 +50,7 @@ fn main() {
     let mut network = Arc::new(NetworkModule::new("", 10000));
     // network.add_route_strategy("google.com".to_string(), HostRouteStrategy::Probe(false, false, "127.0.0.1".to_string(), 1081, None, 0));
     // network.add_route_strategy("youtube.com".to_string(), HostRouteStrategy::Proxy("127.0.0.1".to_string(), 1081, None, 0));
-    network.add_route_strategy("\\S+".to_string(), HostRouteStrategy::Probe(false, false, "127.0.0.1".to_string(), 1081, None, 0));
+    network.add_route_strategy("\\S+".to_string(), HostRouteStrategy::Probe(false, false, "192.168.50.58".to_string(), 10808, None, 0));
     let background_network = network.clone();
     spawn(move || background_network.run());
 
@@ -204,7 +204,8 @@ impl App {
                 ("Process".to_string(), "🔧 Process".to_string()),
                 ("Connection".to_string(), "🔧 Connection".to_string()),
                 ("DnsConfig".to_string(), "🔧 Dns Config".to_string()),
-                ("Proxy".to_string(), "🔧 Proxy".to_string())
+                ("Proxy".to_string(), "🔧 Proxy".to_string()),
+                ("Rule".to_string(), "🔧 Rule".to_string())
             ],
             selected_menu: "Overview".to_string(),
             network_stared: false
