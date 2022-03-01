@@ -50,6 +50,7 @@ fn main() {
     let mut network = Arc::new(NetworkModule::new("", 10000));
     // network.add_route_strategy("google.com".to_string(), HostRouteStrategy::Probe(false, false, "127.0.0.1".to_string(), 1081, None, 0));
     // network.add_route_strategy("youtube.com".to_string(), HostRouteStrategy::Proxy("127.0.0.1".to_string(), 1081, None, 0));
+    network.add_route_strategy("github.com".to_string(), HostRouteStrategy::Proxy("192.168.50.58".to_string(), 10808, None, 0));
     network.add_route_strategy("\\S+".to_string(), HostRouteStrategy::Probe(false, false, "192.168.50.58".to_string(), 10808, None, 0));
     let background_network = network.clone();
     spawn(move || background_network.run());
@@ -1184,8 +1185,8 @@ pub mod tests {
     #[test]
     pub fn test_regex() {
         setup_log();
-        let regex_a = regex::Regex::from_str("\\S+").unwrap();
-        match regex_a.captures("123") {
+        let regex_a = regex::Regex::from_str("github.com").unwrap();
+        match regex_a.captures("www.github.com") {
             None => {
                 log::info!("capture empty")
             }
