@@ -524,7 +524,7 @@ impl TunServer {
         self.run_ip_packet_transfer(tun_socket, relay_addr, relay_port);
     }
 
-    fn run_ip_packet_transfer(&mut self, mut tun_socket: TunSocket, relay_addr: Ipv4Addr, relay_port: u16) {
+    fn run_ip_packet_transfer<T>(&mut self, mut tun_socket: T, relay_addr: Ipv4Addr, relay_port: u16) where T: Read + Write {
         loop {
             match self.transfer_ip_packet(&mut tun_socket, relay_addr, relay_port) {
                 Err(errors) => {
@@ -535,8 +535,10 @@ impl TunServer {
         }
     }
 
-    fn transfer_ip_packet(&mut self, mut tun_socket: &mut TunSocket,
-                          relay_addr: Ipv4Addr, relay_port: u16) -> anyhow::Result<()> {
+    fn transfer_ip_packet<T>(&mut self, mut tun_socket: T,
+                          relay_addr: Ipv4Addr, relay_port: u16) -> anyhow::Result<()>
+        where T: Read + Write {
+
         let nat_session_manager = self.nat_session_manager.clone();
         let mut socket_buf = [0u8; 4096];
         let mut ipv4_packet = match self.read_ipv4_packet(&mut tun_socket, &mut socket_buf) {
@@ -562,10 +564,11 @@ impl TunServer {
         Ok(())
     }
 
-    fn transfer_tcp_packet(&self, tun_socket: &mut TunSocket,
+    fn transfer_tcp_packet<T>(&self, tun_socket: &mut T,
                            relay_addr: Ipv4Addr, relay_port: u16,
                            nat_session_manager: Arc<Mutex<NatSessionManager>>,
-                           mut ipv4_packet: Ipv4Packet<&mut [u8]>) -> anyhow::Result<()> {
+                           mut ipv4_packet: Ipv4Packet<&mut [u8]>) -> anyhow::Result<()>
+        where T: Read + Write {
         let (src_addr, dst_addr) = {
             (ipv4_packet.src_addr(), ipv4_packet.dst_addr())
         };
@@ -623,7 +626,7 @@ impl TunServer {
         Ok(())
     }
 
-    fn read_ipv4_packet<'a>(&self, tun_socket: &mut TunSocket, byte_mut: &'a mut [u8]) -> anyhow::Result<Ipv4Packet<&'a mut [u8]>> {
+    fn read_ipv4_packet<'a, T>(&self, mut tun_socket: T, byte_mut: &'a mut [u8]) -> anyhow::Result<Ipv4Packet<&'a mut [u8]>> where T: Read + Write  {
         let read_size = match tun_socket.read(byte_mut) {
             Ok(size) => { size }
             Err(error) => {
