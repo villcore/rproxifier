@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use async_std_resolver::{resolver, config, AsyncStdResolver};
 use crate::dns::resolve::{ForwardingDnsResolver, DirectDnsResolver, UserConfigDnsResolver, DnsResolver, ConfigDnsResolver, FakeIpManager, resolve_host};
 use crate::dns::server::DnsUdpServer;
-use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpPacket, IpVersion};
+use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpPacket, IpVersion, Ipv4Address};
 
 use log::{info, error, Level};
 use std::collections::{HashMap, LinkedList};
@@ -18,7 +18,7 @@ use tokio::net::{TcpStream, TcpListener};
 use std::sync::{Arc, RwLock, Mutex, PoisonError, MutexGuard};
 use std::str::FromStr;
 use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncRead, AsyncWrite};
 use crate::dns::protocol::{QueryType, DnsPacket, DnsRecord, TransientTtl};
 use std::any::Any;
 use std::future::Future;
@@ -30,6 +30,12 @@ use eframe::epi::Frame;
 use eframe::epi::egui::Ui;
 use tokio::runtime::Runtime;
 use std::sync::mpsc::{channel, RecvTimeoutError};
+use dashmap::DashMap;
+use std::collections::hash_map::RandomState;
+use dashmap::mapref::one::{Ref, RefMut};
+use regex::Regex;
+use voluntary_servitude::vs;
+use std::iter::FromIterator;
 
 mod dns;
 mod sys;
@@ -42,6 +48,9 @@ fn main() {
 
     // run network module
     let mut network = Arc::new(NetworkModule::new("", 10000));
+    // network.add_route_strategy("google.com".to_string(), HostRouteStrategy::Probe(false, false, "127.0.0.1".to_string(), 1081, None, 0));
+    // network.add_route_strategy("youtube.com".to_string(), HostRouteStrategy::Proxy("127.0.0.1".to_string(), 1081, None, 0));
+    network.add_route_strategy("\\S+".to_string(), HostRouteStrategy::Probe(false, false, "127.0.0.1".to_string(), 1081, None, 0));
     let background_network = network.clone();
     spawn(move || background_network.run());
 
@@ -227,43 +236,59 @@ impl eframe::epi::App for App {
         });
 
         // TODO: overview
-        egui::CentralPanel::default().show(ctx, |ui|{
-
-            ui.vertical_centered(|ui| {
-                ui.heading("Overview");
-                ui.separator();
-            });
-
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(), |ui|{
-                    ui.add_space(30.0);
-                    if gui::toggle::toggle_ui_compact(ui, &mut self.network_stared).changed() {
-                        if self.network_stared {
-                            self.network_module.setup_dns()
-                        } else {
-                            self.network_module.clear_dns()
-                        }
-                    }
-
-                    ui.add_space(10.0);
-                    if self.network_stared {
-                        ui.label(RichText::new("network started").color(Color32::from_rgb(0x20, 0xaf, 0x24)).strong());
-                    } else {
-                        ui.label(RichText::new("network not started").color(Color32::RED).strong());
-                    }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Overview
+            if self.selected_menu == "Overview" {
+                ui.vertical_centered(|ui| {
+                    ui.heading("Overview");
+                    ui.separator();
                 });
-            });
-        });
-    }
 
-    fn name(&self) -> &str {
-        "rproxifier"
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(), |ui| {
+                        ui.add_space(30.0);
+                        if gui::toggle::toggle_ui_compact(ui, &mut self.network_stared).changed() {
+                            if self.network_stared {
+                                self.network_module.setup_dns()
+                            } else {
+                                self.network_module.clear_dns()
+                            }
+                        }
+
+                        ui.add_space(10.0);
+                        if self.network_stared {
+                            ui.label(RichText::new("network started").color(Color32::from_rgb(0x20, 0xaf, 0x24)).strong());
+                        } else {
+                            ui.label(RichText::new("network not started").color(Color32::RED).strong());
+                        }
+                    });
+                });
+            }
+
+            // process
+            else if self.selected_menu == "Process" {
+                ui.vertical_centered(|ui| {
+                    ui.heading("Process");
+                    ui.separator();
+                });
+            }
+
+            // Connection
+
+            // DnsConfig
+
+            // Proxy
+        });
     }
 
     fn on_exit(&mut self) {
         if self.network_stared {
             self.network_module.clear_dns();
         }
+    }
+
+    fn name(&self) -> &str {
+        "rproxifier"
     }
 }
 
@@ -287,8 +312,8 @@ pub struct NetworkModule {
     pub dns_listen: String,
     pub dns_setup: DNSSetup,
     pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
-    // pub fake_ip_manager: Arc<FakeIpManager>,
-    // pub config_dns_resolver: ConfigDnsResolver,
+    pub host_route_manager: Arc<HostRouteManager>,
+    pub fake_ip_manager: Arc<FakeIpManager>,
 }
 
 impl NetworkModule {
@@ -298,7 +323,13 @@ impl NetworkModule {
             dns_listen: dns_listen.to_string(),
             dns_setup: sys::darwin::DNSSetup::new(dns_listen.to_string()),
             nat_session_manager: Arc::new(Mutex::new(NatSessionManager::new(net_session_begin_port))),
+            host_route_manager: Arc::new(Default::default()),
+            fake_ip_manager: Arc::new(FakeIpManager::new((10, 0, 0, 100)))
         }
+    }
+
+    pub fn add_route_strategy(&self, host: String, strategy: HostRouteStrategy) {
+        self.host_route_manager.add_route_strategy(host, strategy);
     }
 
     pub fn run_relay_server(&self) {
@@ -324,8 +355,9 @@ impl NetworkModule {
 
     pub fn run(&self) {
         self.set_rlimit(30000);
-        let nat_session_manager = Arc::new(Mutex::new(NatSessionManager::new(10000)));
-        let fake_ip_manager = Arc::new(FakeIpManager::new((10, 0, 0, 100)));
+        let nat_session_manager = self.nat_session_manager.clone();
+        let fake_ip_manager = self.fake_ip_manager.clone();
+        let host_route_manager = self.host_route_manager.clone();
 
         // start tun_server
         let (stared_event_sender, mut stared_event_receiver) = std::sync::mpsc::channel();
@@ -341,7 +373,7 @@ impl NetworkModule {
         }
 
         // start dns_server & tcp_relay_server
-        self.run_async_component(nat_session_manager.clone(), fake_ip_manager.clone());
+        self.run_async_component(nat_session_manager.clone(), fake_ip_manager.clone(), host_route_manager.clone());
     }
 
     pub fn run_sync_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>, stared_event_sender: std::sync::mpsc::Sender<bool>) {
@@ -358,7 +390,7 @@ impl NetworkModule {
         spawn(move || tun_server.run_tun_server(stared_event_sender));
     }
 
-    pub fn run_async_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>, fake_ip_manager: Arc<FakeIpManager>) {
+    pub fn run_async_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>, fake_ip_manager: Arc<FakeIpManager>, host_route_manager: Arc<HostRouteManager>) {
         log::info!("run async component");
         let run_time = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(run_time) => {
@@ -388,6 +420,7 @@ impl NetworkModule {
                 resolver: Arc::new(resolver.clone()),
                 fake_ip_manager: fake_ip_manager.clone(),
                 nat_session_manager: nat_session_manager.clone(),
+                host_route_manager: host_route_manager.clone(),
                 listen_addr: (127, 0, 0, 1),
                 listen_port: 1300
             };
@@ -624,6 +657,7 @@ pub struct TcpRelayServer {
     pub resolver: Arc<AsyncStdResolver>,
     pub fake_ip_manager: Arc<FakeIpManager>,
     pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
+    pub host_route_manager: Arc<HostRouteManager>,
     pub listen_addr: (u8, u8, u8, u8),
     pub listen_port: u16,
 }
@@ -687,111 +721,203 @@ impl TcpRelayServer {
             Some((src_addr, src_port, dst_addr, dst_port)) => {
                 log::info!("real address is {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
                 let resolver_copy = self.resolver.clone();
-                let fake_ip_manager_copy = self.fake_ip_manager.clone();
+                let fake_ip_manager = self.fake_ip_manager.clone();
+                let host_route_manager = self.host_route_manager.clone();
                 tokio::spawn(async move {
                     let dst_addr_bytes = dst_addr.octets();
-                    let real_host_port = match fake_ip_manager_copy.get_host(&(dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3])) {
+                    let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
+                    let origin_host_port = match fake_ip_manager.get_host(&fake_ip) {
                         None => {
                             log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                            None
+                            return
                         }
 
-                        Some(host) => {
-                            log::info!("get host from fake_ip {} success, host {}", dst_addr.to_string(), host);
-
-                            let mut host_splits: Vec<&str> = host.split(".").collect();
-                            let host_num_splits: Vec<u8> = host_splits.iter()
-                                .map(|s| s.parse::<u8>())
-                                .filter(|r| r.is_ok())
-                                .map(|r| r.unwrap())
-                                .collect();
-
-                            let host_split_len = host_splits.len();
-                            if host_split_len == 4 && host_num_splits.len() == host_split_len {
-                                // 如果是点号ip地址格式，选择直接连接
-                                Some((host, dst_port))
-                            } else {
-                                // 如果是字符串host格式，需要dns解析
-                                match resolve_host(resolver_copy, &host).await {
-                                    Ok(ipv4_addr) => {
-                                        Some((ipv4_addr.to_string(), dst_port))
-                                    }
-                                    Err(_) => {
-                                        log::error!("resolve host {} error", host);
-                                        None
-                                    }
-                                }
-                            }
-                        }
+                        Some(host) => (host, dst_port)
                     };
 
-                    match real_host_port {
-                        None => {
-                            log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                        }
-                        Some((real_host, real_port)) => {
-                            let (host, port) = (real_host.as_str(), real_port);
-                            let (mut src_read, mut src_write) = tcp_socket.split();
-                            let mut dst_socket = match TcpStream::connect((host, port)).await {
+                    let rule_strategy = match host_route_manager.get_route_strategy(&origin_host_port.0) {
+                        None => &HostRouteStrategy::Direct,
+                        Some(strategy) => strategy
+                    };
+
+                    match rule_strategy {
+                        HostRouteStrategy::Direct => {
+                            let direct_address_port = TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy, fake_ip_manager).await;
+                            let (host, port) = match direct_address_port {
+                                None => {
+                                    log::error!("get host from fake_ip {} error", dst_addr.to_string());
+                                    return
+                                }
+                                Some((real_host, real_port)) => (real_host.to_string(), real_port)
+                            };
+
+                            let mut dst_socket = match TcpStream::connect((host.as_str(), port)).await {
                                 Ok(dst_socket) => {
-                                    log::info!("session {} => connect real_addr {}:{}", session_port, host, port);
+                                    log::info!("session {} => connect real_addr {}:{}", session_port, &host, port);
                                     dst_socket
                                 }
                                 Err(errors) => {
-                                    log::error!("session {} => connect real addr {}:{} error, {}", session_port, host, port, errors);
+                                    log::error!("session {} => connect real addr {}:{} error, {}", session_port, &host, port, errors);
                                     return;
                                 }
                             };
+                            let mut stream_pipe = StreamPipe::new(4096, tcp_socket, dst_socket);
+                            stream_pipe.pipe_loop().await
+                        }
 
-                            let (mut dst_read, mut dst_write) = dst_socket.split();
+                        HostRouteStrategy::Proxy(addr, port, direct_ip, last_update_time) => {
+                            // host_route_manager
+                            // TODO: dns_lookup cache.
+                            let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &*addr, *port).await {
+                                None => {
+                                    return
+                                },
+                                Some((ip, port)) => (ip, port)
+                            };
 
-                            let mut src_to_dst_buf = BytesMut::with_capacity(4096);
-                            let mut dst_to_src_buf = BytesMut::with_capacity(4096);
+                            let target_addr = format!("{}:{}", origin_host_port.0, origin_host_port.1);
+                            let mut proxy_socket = tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await.unwrap();
+                            let mut stream_pipe = StreamPipe::new(4096, tcp_socket, proxy_socket);
+                            stream_pipe.pipe_loop().await
+                        }
 
-                            loop {
-                                tokio::select! {
-                                        read_size = src_read.read_buf(&mut src_to_dst_buf) => {
-                                            let size = match read_size {
-                                                 Ok(size) => {
-                                                     size as usize
-                                                 }
-                                                 Err(errors) => {
-                                                     break;
-                                                 }
-                                            };
+                        HostRouteStrategy::Probe(tested, need_proxy, addr, port, direct_ip, last_update_time) => {
+                            let mut need_proxy = *need_proxy;
+                            let (dst_socket, direct_connected) = if !tested {
+                                let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy.clone(), fake_ip_manager).await {
+                                    None => None,
+                                    Some(direct_ip_port) => Some(direct_ip_port)
+                                };
 
-                                            if size <= 0 {
-                                                log::info!("**********dst write close");
-                                                break;
-                                            }
-
-                                            dst_write.write_buf(&mut src_to_dst_buf).await;
-                                            src_to_dst_buf.clear();
-                                        },
-
-                                        write_size = dst_read.read_buf(&mut dst_to_src_buf) => {
-                                            let size = match write_size {
-                                                 Ok(size) => {
-                                                     size as usize
-                                                 }
-                                                 Err(errors) => {
-                                                     break;
-                                                 }
-                                            };
-
-                                            if size <= 0 {
-                                                log::info!("**********src write close");
-                                                break;
-                                            }
-                                            src_write.write_buf(&mut dst_to_src_buf).await;
-                                            dst_to_src_buf.clear();
-                                            // log::info!("src write >>>>> {}", size);
+                                let test_dst_socket = match direct_address_port {
+                                    None => (None, false),
+                                    Some(direct_address_port) => {
+                                        log::info!("connect to {}:{}", direct_address_port.0, direct_address_port.1);
+                                        match TcpRelayServer::connect_with_timeout(direct_address_port,Duration::from_secs(3)).await {
+                                            Ok(mut dst_socket) => (Some(dst_socket), true),
+                                            Err(errors) => {
+                                                log::info!("try connect to timeout");
+                                                (None, false)
+                                            },
                                         }
                                     }
+                                };
+                                host_route_manager.mark_probe_direct(&origin_host_port.0, !test_dst_socket.1);
+                                test_dst_socket
+                            } else {
+                                if !need_proxy {
+                                    let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy.clone(), fake_ip_manager).await {
+                                        None => return,
+                                        Some(direct_ip_port) => Some(direct_ip_port)
+                                    };
+
+                                    match direct_address_port {
+                                        None => return,
+                                        Some(direct_address_port) => {
+                                            log::info!("connect to {}:{}", direct_address_port.0, direct_address_port.1);
+                                            match TcpStream::connect(direct_address_port).await {
+                                                Ok(mut dst_socket) => (Some(dst_socket), true),
+                                                Err(errors) => return,
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    (None, !need_proxy)
+                                }
+                            };
+
+                            if direct_connected {
+                                // direct
+                                let mut stream_pipe = StreamPipe::new(4096, tcp_socket, dst_socket.unwrap());
+                                stream_pipe.pipe_loop().await
+                            } else {
+                                // proxy
+                                let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &*addr, *port).await {
+                                    None => {
+                                        return
+                                    },
+                                    Some((ip, port)) => (ip, port)
+                                };
+
+                                let target_addr = format!("{}:{}", origin_host_port.0, origin_host_port.1);
+                                let mut proxy_socket = tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await.unwrap();
+                                let mut stream_pipe = StreamPipe::new(4096, tcp_socket, proxy_socket);
+                                stream_pipe.pipe_loop().await
                             }
+                        }
+
+                        HostRouteStrategy::Reject => {
+                            log::info!("reject connection to {}:{}",origin_host_port.0, origin_host_port.1)
                         }
                     }
                 });
+            }
+        }
+    }
+
+    pub async fn connect_with_timeout<A: tokio::net::ToSocketAddrs>(addr: A, timeout_sec: Duration) -> anyhow::Result<TcpStream> {
+        let timeout_sec = Duration::from_secs(5);
+        let connected_socket = tokio::select! {
+            connected_socket = TcpStream::connect(addr) => {
+                match connected_socket {
+                    Ok(socket) => {
+                        anyhow::Ok(socket)
+                    }
+                    Err(errors) => {
+                        Err(anyhow::anyhow!(format!("connect error, {}", errors)))
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep(timeout_sec) => {
+                    Err(anyhow::anyhow!(format!("connect timeout")))
+            }
+        };
+        return connected_socket;
+    }
+
+    async fn resolve_direct_ip_port(dst_addr: Ipv4Addr, dst_port: u16,
+                                    resolver: Arc<AsyncStdResolver>,
+                                    fake_ip_manager: Arc<FakeIpManager>) -> Option<(String, u16)> {
+
+        let dst_addr_bytes = dst_addr.octets();
+        let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
+        let direct_address_port = match fake_ip_manager.get_host(&fake_ip) {
+            None => {
+                log::error!("get host from fake_ip {} error", dst_addr.to_string());
+                None
+            }
+
+            Some(host) => {
+                log::info!("get host from fake_ip {} success, host {}", dst_addr.to_string(), host);
+                TcpRelayServer::resolve_host_ip(resolver, &host, dst_port).await
+            }
+        };
+        direct_address_port
+    }
+
+    async fn resolve_host_ip(resolver: Arc<AsyncStdResolver>, host: &str, port: u16) -> Option<((String, u16))> {
+        let mut host_splits: Vec<&str> = host.split(".").collect();
+        let host_num_splits: Vec<u8> = host_splits.iter()
+            .map(|s| s.parse::<u8>())
+            .filter(|r| r.is_ok())
+            .map(|r| r.unwrap())
+            .collect();
+
+        let host_split_len = host_splits.len();
+        if host_split_len == 4 && host_num_splits.len() == host_split_len {
+            // 如果是点号ip地址格式，选择直接连接
+            Some((host.to_string(), port))
+        } else {
+            // 如果是字符串host格式，需要dns解析
+            match resolve_host(resolver, &host).await {
+                Ok(ipv4_addr) => {
+                    Some((ipv4_addr.to_string(), port))
+                }
+                Err(_) => {
+                    log::error!("resolve host {} error", host);
+                    None
+                }
             }
         }
     }
@@ -820,5 +946,283 @@ impl DnsManager {
             Box::new(config_dns_resolver),
         ).await;
         dns_server.run_server().await;
+    }
+}
+
+///
+pub struct HostRouteManager {
+    host_regex_route_strategy: voluntary_servitude::VS<(String, regex::Regex, HostRouteStrategy)>,
+    host_route_strategy: DashMap<String, HostRouteStrategy>,
+}
+
+impl Default for HostRouteManager {
+    fn default() -> Self {
+        HostRouteManager::new(vec![])
+    }
+}
+
+impl HostRouteManager {
+
+    pub fn new(host_regex_route_strategy: Vec<(String, HostRouteStrategy)>) -> Self {
+        let regex_route_list: Vec<(String, regex::Regex, HostRouteStrategy)> = host_regex_route_strategy.into_iter()
+            .map(|(host, strategy)| {
+                match regex::Regex::new(&host) {
+                    Ok(regex) => Some((host, regex, strategy)),
+                    Err(errors) => {
+                        log::error!("create regex {} error, {}", host, errors);
+                        None
+                    }
+                }
+            })
+            .filter(|result| result.is_some())
+            .map(|result| result.unwrap())
+            .collect();
+        Self {
+            host_regex_route_strategy: voluntary_servitude::VS::from_iter(regex_route_list),
+            host_route_strategy: Default::default(),
+        }
+    }
+
+    pub fn add_route_strategy(&self, host: String, strategy: HostRouteStrategy) {
+        if let Ok(regex) = regex::Regex::new(&host) {
+            self.host_regex_route_strategy.append((host, regex, strategy));
+        }
+    }
+
+    pub fn get_route_strategy(&self, host: &str) -> Option<(&HostRouteStrategy)> {
+        match self.host_route_strategy.get(host) {
+            Some(kv_ref) => return {
+                Some(kv_ref.value())
+            },
+            None => {}
+        }
+
+        let mut iter = self.host_regex_route_strategy.iter();
+        for (_, regex_matcher, strategy) in &mut iter {
+            if let Some(_) = regex_matcher.captures(host) {
+                let route_strategy = strategy.get_copy();
+                self.host_route_strategy.insert(host.to_string(), route_strategy);
+                break
+            }
+        }
+
+        return match self.host_route_strategy.get(host) {
+            Some(kv_ref) => {
+                Some(kv_ref.value())
+            },
+            None => Some(&HostRouteStrategy::Direct)
+        }
+    }
+
+    pub fn mark_probe_direct(&self, host: &str, need_proxy: bool) {
+        let strategy = match self.host_route_strategy.get_mut(host) {
+            None => None,
+            Some(kv_ref) => {
+                match kv_ref.value() {
+                    HostRouteStrategy::Probe(_, _, ip_addr, port, direct_ip_addr, last_update_time) => {
+                        Some(HostRouteStrategy::Probe(true, need_proxy, ip_addr.to_string(), *port, *direct_ip_addr, *last_update_time))
+                    }
+                    _ => None
+                }
+            }
+        };
+
+        if let Some(strategy) = strategy {
+            self.host_route_strategy.insert(host.to_string(), strategy);
+        }
+    }
+
+    pub fn set_proxy_server_direct_ip(&self, host: &str, direct_ip_addr: Ipv4Addr) {
+        let strategy = match self.host_route_strategy.get_mut(host) {
+            None => None,
+            Some(kv_ref) => {
+                match kv_ref.value() {
+                    HostRouteStrategy::Probe(tested, need_proxy, ip_addr, port, _, _) => {
+                        Some(HostRouteStrategy::Probe(*tested, *need_proxy, ip_addr.to_string(), *port, Some(direct_ip_addr), NatSessionManager::get_now_time()))
+                    }
+                    _ => None
+                }
+            }
+        };
+
+        if let Some(strategy) = strategy {
+            self.host_route_strategy.insert(host.to_string(), strategy);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum HostRouteStrategy {
+    Direct,
+
+    /// Proxy(proxy_server_addr, proxy_server_port, cached, direct_proxy_server_ip, last_update_time)
+    Proxy(String, u16, Option<Ipv4Addr>, u64),
+
+    /// Probe(tested, need_proxy, proxy_server_addr, proxy_server_port, proxy_server_direct_ip, last_update_time)
+    Probe(bool, bool, String, u16, Option<Ipv4Addr>, u64),
+
+    Reject,
+}
+
+impl HostRouteStrategy {
+
+    pub fn get_copy(&self) -> HostRouteStrategy {
+        let route_strategy = match self {
+            HostRouteStrategy::Direct => HostRouteStrategy::Direct,
+            HostRouteStrategy::Proxy(addr, port, direct_ip, last_update_time) => HostRouteStrategy::Proxy(addr.to_string(), *port, *direct_ip, *last_update_time),
+            HostRouteStrategy::Probe(tested, need_proxy, addr, port, direct_ip, last_update_time) => HostRouteStrategy::Probe(*tested, *need_proxy, addr.to_string(), *port, *direct_ip, *last_update_time),
+            HostRouteStrategy::Reject => HostRouteStrategy::Reject
+        };
+        return route_strategy
+    }
+}
+
+pub struct StreamPipe<S, D> where S: AsyncRead + AsyncWrite, D: AsyncRead + AsyncWrite{
+    pub buf_size: usize,
+    pub src_stream: S,
+    pub dst_stream: D
+}
+
+impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRead + AsyncWrite + Unpin {
+
+    pub fn new(buf_size: usize, src_stream: S, dst_stream: D) -> Self {
+        StreamPipe { buf_size, src_stream, dst_stream }
+    }
+
+    pub async fn pipe_loop(&mut self) {
+        let mut src_to_dst_buf = BytesMut::with_capacity(self.buf_size);
+        let mut dst_to_src_buf = BytesMut::with_capacity(self.buf_size);
+
+        loop {
+            tokio::select! {
+              // handle src to dst pipe
+              read_size = self.src_stream.read_buf(&mut src_to_dst_buf) => {
+                let size = match read_size {
+                  Ok(size) => {size as usize}
+                  Err(errors) => {break}
+                };
+
+                if size <= 0 {
+                    log::info!("**********dst write close");
+                    break;
+                }
+
+                self.dst_stream.write_buf(&mut src_to_dst_buf).await;
+              },
+
+              // handle dst to dst pipe
+              write_size = self.dst_stream.read_buf(&mut dst_to_src_buf) => {
+                let size = match write_size {
+                     Ok(size) => {
+                         size as usize
+                     }
+                     Err(errors) => {
+                         break;
+                     }
+                };
+
+                if size <= 0 {
+                    log::info!("**********src write close");
+                    break;
+                }
+                self.src_stream.write_buf(&mut dst_to_src_buf).await;
+              }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use crate::{setup_log, HostRouteManager, HostRouteStrategy};
+    use crate::HostRouteStrategy::{Proxy, Probe};
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::str::FromStr;
+    use regex::Captures;
+    use tokio::net::{TcpStream, ToSocketAddrs};
+    use std::io::Error;
+    use tokio::time::Duration;
+    use tokio::io;
+
+    #[test]
+    pub fn test_host_route_manager() {
+        setup_log();
+        log::info!("test");
+
+        let route = HostRouteManager::new(vec![
+            ("google.com".to_string(), Proxy("www.baidu1.com".to_string(), 80, None, 0)),
+            ("facebook.com".to_string(), Probe(false, false, "www.baidu2.com".to_string(), 80, None, 0)),
+            ("www.youtube.com".to_string(), Proxy("www.bing3.com".to_string(), 80, None, 0))
+        ]);
+
+        let host = "www.facebook.com";
+        match route.get_route_strategy(host) {
+            None => {
+                log::info!("get host {} strategy invalid", host);
+            }
+            Some(strategy) => {
+                log::info!("get host {} strategy {:?}", host, strategy);
+            }
+        }
+        log::info!("first get complete");
+
+        route.mark_probe_direct(host, true);
+        match route.get_route_strategy(host) {
+            None => {
+                log::info!("get host {} strategy invalid", host);
+            }
+            Some(strategy) => {
+                log::info!("get host {} strategy {:?}", host, strategy);
+            }
+        }
+    }
+
+    #[test]
+    pub fn test_regex() {
+        setup_log();
+        let regex_a = regex::Regex::from_str("\\S+").unwrap();
+        match regex_a.captures("123") {
+            None => {
+                log::info!("capture empty")
+            }
+            Some(_) => {
+                log::info!("capture valid")
+            }
+        }
+    }
+
+    #[test]
+    pub fn test_tokio_connect_timeout() {
+        setup_log();
+        let run_time = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(run_time) => {
+                run_time
+            },
+            Err(errors) => {
+                log::error!("create runtime error, {}", errors);
+                return
+            }
+        };
+        run_time.block_on(async {
+            log::info!("connect start");
+            let timeout_sec = Duration::from_secs(5);
+            let connected_socket = tokio::select! {
+                connected_socket = TcpStream::connect(("108.160.166.137", 443)) => {
+                    match connected_socket {
+                        Ok(socket) => {
+                            Some(socket)
+                        }
+                        Err(errors) => {
+                            None
+                        }
+                    }
+                }
+
+                _ = tokio::time::sleep(timeout_sec) => {
+                    None
+                }
+            };
+            log::info!("connect end");
+        });
     }
 }

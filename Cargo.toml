@@ -19,8 +19,11 @@ chrono = "0.4.13"
 async-std-resolver = "0.21.0-alpha.4"
 trust-dns-proto = { version = "0.21.0-alpha.4", default-features = false }
 tokio = { version = "1.15.0", features = ["full"] }
+tokio-socks = "0.5.1"
 libc = "0.2.74"
 bytes = "1.1.0"
 dashmap = "5.0.0"
 anyhow = "1.0.53"
 eframe = "0.17.0"
+regex = "1.5.4"
+voluntary-servitude = "4.0.8"
