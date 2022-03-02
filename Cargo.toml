@@ -8,6 +8,27 @@ edition = "2021"
 [dependencies]
 [target.'cfg(any(target_os = "windows"))'.dependencies]
 wintun = "0.2.1"
+smoltcp = { version = "0.8.0", default-features = false, features = ["proto-ipv6", "proto-ipv4", "std"] }
+log = "0.4.14"
+log4rs = "1.0.0"
+async-trait = "0.1.36"
+async-std = { version = "1.8.0", features = ["unstable"] }
+tracing = "0.1.19"
+tracing-subscriber = "0.3.9"
+tracing-futures = { version = "0.2.4", features = ["std-future"], default-features = false }
+rand = "0.7.3"
+chrono = "0.4.13"
+async-std-resolver = "0.21.0-alpha.4"
+trust-dns-proto = { version = "0.21.0-alpha.4", default-features = false }
+tokio = { version = "1.15.0", features = ["full"] }
+tokio-socks = "0.5.1"
+libc = "0.2.74"
+bytes = "1.1.0"
+dashmap = "5.0.0"
+anyhow = "1.0.53"
+eframe = "0.17.0"
+regex = "1.5.4"
+voluntary-servitude = "4.0.8"
 
 [target.'cfg(any(target_os = "macos"))'.dependencies]
 smoltcp = { version = "0.8.0", default-features = false, features = ["proto-ipv6", "proto-ipv4", "std"] }

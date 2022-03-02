@@ -1,4 +1,4 @@
-use std::io::{Read, Write, ErrorKind};
+use std::io::{Read, Write};
 use std::thread::sleep;
 use std::thread::spawn;
 use std::time::Duration;
@@ -40,6 +40,7 @@ use dashmap::mapref::one::{Ref, RefMut};
 use regex::Regex;
 use voluntary_servitude::vs;
 use std::iter::FromIterator;
+use std::num::ParseIntError;
 
 mod dns;
 mod sys;
@@ -203,7 +204,14 @@ pub struct App {
     // gui
     function_menu_list: Vec<(String, String)>,
     selected_menu: String,
-    network_stared: bool
+    network_stared: bool,
+
+    // proxy server module
+    // proxy module
+    add_proxy_server_config_show: bool,
+    add_proxy_server_config_name: String,
+    add_proxy_server_config_addr: String,
+    add_proxy_server_config_port: String,
 }
 
 impl App {
@@ -219,7 +227,11 @@ impl App {
                 ("Rule".to_string(), "🔧 Rule".to_string())
             ],
             selected_menu: "Overview".to_string(),
-            network_stared: false
+            network_stared: false,
+            add_proxy_server_config_show: false,
+            add_proxy_server_config_name: "".to_string(),
+            add_proxy_server_config_addr: "".to_string(),
+            add_proxy_server_config_port: "".to_string()
         }
     }
 
@@ -227,13 +239,14 @@ impl App {
 
         // menu label
         ui.vertical_centered(|ui| {
+            ui.add_space(10.0);
             ui.heading("💻 Menu");
         });
         ui.separator();
 
         // menu list
         for (menu_item, menu_title) in self.function_menu_list.iter() {
-            if ui.selectable_label(menu_item.to_string() == self.selected_menu, menu_title).clicked() {
+            if ui.selectable_label(menu_item.to_string() == self.selected_menu, RichText::new(menu_title).strong()).clicked() {
                 self.selected_menu = menu_item.to_string();
             }
             ui.separator();
@@ -247,13 +260,13 @@ impl eframe::epi::App for App {
             self.main_function_menu_ui(ui);
         });
 
-        // TODO: overview
         egui::CentralPanel::default().show(ctx, |ui| {
             // Overview
             if self.selected_menu == "Overview" {
                 ui.vertical_centered(|ui| {
                     ui.heading("Overview");
                     ui.separator();
+                    ui.add_space(10.0);
                 });
 
                 ui.horizontal(|ui| {
@@ -290,6 +303,110 @@ impl eframe::epi::App for App {
             // DnsConfig
 
             // Proxy
+            else if self.selected_menu == "Proxy" {
+                ui.vertical_centered(|ui| {
+                    ui.heading("Proxy");
+                    ui.separator();
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(), |ui| {
+                        ui.add_space(30.0);
+                        ui.button("Test Connection");
+                        ui.button("Remove Server");
+
+                        // add server
+                        if ui.button("Add Server").clicked() {
+                            log::info!("Add Server");
+                            if !self.add_proxy_server_config_show {
+                                self.add_proxy_server_config_show = true;
+                            }
+                        };
+
+                        if self.add_proxy_server_config_show {
+                            egui::Window::new("Add Server").resizable(true).open(&mut self.add_proxy_server_config_show).show(ctx, |ui| {
+                                egui::Grid::new("add-server-input").num_columns(2).show(ui, |ui| {
+                                    ui.label("name:");
+                                    ui.add(egui::TextEdit::singleline(&mut self.add_proxy_server_config_name).hint_text("proxy server name"));
+                                    ui.end_row();
+
+                                    ui.label("addr:");
+                                    ui.add(egui::TextEdit::singleline(&mut self.add_proxy_server_config_addr).hint_text("proxy server addr"));
+                                    ui.end_row();
+
+
+                                    ui.label("port:");
+                                    ui.add(egui::TextEdit::singleline(&mut self.add_proxy_server_config_port).hint_text("proxy server addr"));
+                                    ui.end_row();
+
+                                    ui.horizontal(|ui|{
+                                        if ui.button(format!("{}     Ok","✅")).clicked() {
+                                            let proxy_config = {
+                                                let name = &self.add_proxy_server_config_name;
+                                                let addr = &self.add_proxy_server_config_addr;
+                                                let port = &self.add_proxy_server_config_port;
+                                                match u16::from_str(port) {
+                                                    Ok(port) => {
+                                                        Ok(ProxyServerConfig {
+                                                            name: name.to_string(),
+                                                            addr: addr.to_string(),
+                                                            port,
+                                                            available: false
+                                                        })
+                                                    }
+                                                    Err(errors) => Err(errors)
+                                                }
+                                            };
+                                            match proxy_config {
+                                                Ok(proxy_config) => {
+                                                    self.network_module.proxy_server_config_manager.add_config(proxy_config);
+                                                }
+                                                Err(errors) => {
+                                                    ui.label(format!("{}", errors));
+                                                }
+                                            }
+                                        };
+
+                                        if ui.button(format!("{} Cancel", "❌")).clicked() {
+                                            // reset config
+                                            // self.reset_proxy_server_config_windows();
+                                            // self.add_proxy_server_config_show = false;
+                                        };
+                                    });
+                                    ui.end_row();
+                                });
+                            });
+                        }
+                        ui.add_space(10.0);
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                // egui::ScrollArea::new([false, true]).show(ui, |ui|{
+                    let proxy_server_config_manager = self.network_module.clone().proxy_server_config_manager.clone();
+                    let config_list = proxy_server_config_manager.get_config_list();
+                    egui::Grid::new("sever_proxy_config_table")
+                        .striped(true)
+                        // .num_columns(3)
+                        .show(ui, |ui| {
+                            let name_label = ui.label("name");
+                            ui.label("addr");
+                            ui.label("port");
+                            ui.label("available");
+                            ui.end_row();
+
+                            for proxy_server_config in config_list {
+                                ui.label(proxy_server_config.name);
+                                ui.label(proxy_server_config.addr);
+                                ui.label(proxy_server_config.port.to_string());
+                                ui.label(if proxy_server_config.available {"available"} else {"unknown"});
+                                ui.end_row();
+                            }
+                        });
+                // });
+            }
         });
     }
 
@@ -319,6 +436,34 @@ impl eframe::epi::App for OverviewModule {
     }
 }
 
+pub struct ProxyModule {
+    // proxy module
+    add_proxy_server_config_show: bool,
+    add_proxy_server_config_name: String,
+    add_proxy_server_config_addr: String,
+    add_proxy_server_config_port: String,
+}
+
+impl Default for ProxyModule {
+    fn default() -> Self {
+        Self {
+            add_proxy_server_config_show: false,
+            add_proxy_server_config_name: "".to_string(),
+            add_proxy_server_config_addr: "".to_string(),
+            add_proxy_server_config_port: "".to_string()
+        }
+    }
+}
+
+impl ProxyModule {
+    fn reset_proxy_server_config_windows(&mut self) {
+        self.add_proxy_server_config_show = false;
+        self.add_proxy_server_config_name = "".to_string();
+        self.add_proxy_server_config_addr = "".to_string();
+        self.add_proxy_server_config_port = "".to_string();
+    }
+}
+
 ///
 pub struct NetworkModule {
     pub dns_listen: String,
@@ -326,6 +471,7 @@ pub struct NetworkModule {
     pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
     pub host_route_manager: Arc<HostRouteManager>,
     pub fake_ip_manager: Arc<FakeIpManager>,
+    pub proxy_server_config_manager: Arc<ProxyServerConfigManager>,
 }
 
 impl NetworkModule {
@@ -336,7 +482,8 @@ impl NetworkModule {
             dns_setup: sys::sys::DNSSetup::new(dns_listen.to_string()),
             nat_session_manager: Arc::new(Mutex::new(NatSessionManager::new(net_session_begin_port))),
             host_route_manager: Arc::new(Default::default()),
-            fake_ip_manager: Arc::new(FakeIpManager::new((10, 0, 0, 100)))
+            fake_ip_manager: Arc::new(FakeIpManager::new((10, 0, 0, 100))),
+            proxy_server_config_manager: Arc::new(Default::default())
         }
     }
 
@@ -1083,6 +1230,87 @@ impl HostRouteManager {
 
         if let Some(strategy) = strategy {
             self.host_route_strategy.insert(host.to_string(), strategy);
+        }
+    }
+}
+
+pub struct ProxyServerConfigManager {
+    pub proxy_server_configs: voluntary_servitude::VS<(ProxyServerConfig)>,
+}
+
+impl Default for ProxyServerConfigManager {
+    fn default() -> Self {
+        Self {
+            proxy_server_configs: Default::default()
+        }
+    }
+}
+
+impl ProxyServerConfigManager {
+
+    pub fn add_config(&self, config: ProxyServerConfig) -> anyhow::Result<()> {
+        for server_config in &mut self.proxy_server_configs.iter() {
+            if server_config.name == config.name {
+                return Err(anyhow::anyhow!(format!("already contain config {} ", config.name)))
+            }
+        }
+
+        self.proxy_server_configs.append(config);
+        Ok(())
+    }
+
+    pub fn remove_config(&self, config_name: String) {
+        let new_configs = voluntary_servitude::VS::new();
+        for config in &mut self.proxy_server_configs.iter() {
+            if config.name != config_name {
+                new_configs.append(config.get_copy());
+            }
+        }
+
+        if new_configs.len() != self.proxy_server_configs.len() {
+            self.proxy_server_configs.swap(&new_configs);
+        }
+    }
+
+    pub fn update_config(&self, new_config: ProxyServerConfig) {
+        let new_configs = voluntary_servitude::VS::new();
+        for config in &mut self.proxy_server_configs.iter() {
+            if config.name == new_config.name {
+                new_configs.append(new_config.get_copy());
+            } else {
+                new_configs.append(config.get_copy());
+            }
+        }
+        self.proxy_server_configs.swap(&new_configs);
+    }
+
+    pub fn get_config_list(&self) -> Vec<ProxyServerConfig> {
+        let mut config_list = Vec::with_capacity(self.proxy_server_configs.len());
+        for server_config in &mut self.proxy_server_configs.iter() {
+            config_list.push(server_config.get_copy())
+        }
+        config_list
+    }
+}
+
+pub struct ProxyServerConfig{
+    pub name: String,
+    pub addr: String,
+    pub port: u16,
+    pub available: bool,
+
+    // TODO:
+    // type(socks, http, etc.)
+    // option password, username
+}
+
+impl ProxyServerConfig {
+    pub fn get_copy(&self) -> ProxyServerConfig {
+        ProxyServerConfig {
+            name: self.name.clone(),
+            addr: self.addr.clone(),
+            port: self.port,
+            available: self.available
         }
     }
 }
