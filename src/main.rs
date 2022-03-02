@@ -13,6 +13,7 @@ use log::{info, error, Level};
 use std::collections::{HashMap, LinkedList};
 #[cfg(target_os="macos")]
 use crate::sys::sys::{setup_ip_route, set_rlimit, DNSSetup};
+#[cfg(target_os="windows")]
 use crate::sys::sys::{DNSSetup};
 use smoltcp::Error;
 #[cfg(target_os="macos")]
@@ -58,17 +59,20 @@ fn main() {
     let background_network = network.clone();
     spawn(move || background_network.run());
 
-    // setup gui
-    // let app = App::new(network.clone());
-    // let options = eframe::NativeOptions {
-    //     transparent: true,
-    //     drag_and_drop_support: true,
-    //     ..Default::default()
-    // };
-    // eframe::run_native(Box::new(app), options);
+    #[cfg(target_os="windows")]
+    {
+         network.setup_dns();
+         sleep(Duration::from_secs(10000));
+    }
 
-    network.setup_dns();
-    sleep(Duration::from_secs(10000));
+    // setup gui
+    let app = App::new(network.clone());
+    let options = eframe::NativeOptions {
+        transparent: true,
+        drag_and_drop_support: true,
+        ..Default::default()
+    };
+    eframe::run_native(Box::new(app), options);
 }
 
 fn setup_log() {
