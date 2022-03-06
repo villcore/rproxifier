@@ -1,0 +1,61 @@
+
+syntax = "proto3";
+
+package abi;
+option java_multiple_files = true;
+option java_package = "org.villcore.rproxifier.core";
+option java_outer_classname = "RproxifierManager";
+option objc_class_prefix = "HLW";
+
+// The greeting service definition.
+service RproxifierManager {
+
+  // Sends a greeting
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+
+  //
+  rpc GetNetState (GetNetStateRequest) returns (GetNetStateRequestReply) {}
+
+  //
+  rpc StartNet (StartNetRequest) returns (StartNetReply) {}
+
+  //
+  rpc StopNet (StopNetRequest) returns (StopNetRequestReply) {}
+}
+
+// The request message containing the user's name.
+message HelloRequest {
+  string name = 1;
+}
+
+// The response message containing the greetings
+message HelloReply {
+  string message = 1;
+}
+
+// The request message containing the user's name.
+message GetNetStateRequest {
+}
+
+// The response message containing the greetings
+message GetNetStateRequestReply {
+  bool state = 1;
+}
+
+// The request message containing the user's name.
+message StartNetRequest {
+}
+
+// The response message containing the greetings
+message StartNetReply {
+  bool state = 1;
+}
+
+// The request message containing the user's name.
+message StopNetRequest {
+}
+
+// The response message containing the greetings
+message StopNetRequestReply {
+  bool state = 1;
+}
