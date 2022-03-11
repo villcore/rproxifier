@@ -24,8 +24,12 @@ pub struct StreamPipe<S, D> where S: AsyncRead + AsyncWrite, D: AsyncRead + Asyn
 
 impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRead + AsyncWrite + Unpin {
 
-    pub fn new(session_port: u16, active_connection_manager: Arc<ActiveConnectionManager>, buf_size: usize, src_stream: S, dst_stream: D) -> Self {
-        StreamPipe { session_port, active_connection_manager, buf_size, src_stream, dst_stream}
+    pub fn new(session_port: u16,
+               active_connection_manager: Arc<ActiveConnectionManager>,
+               buf_size: usize,
+               src_stream: S,
+               dst_stream: D) -> Self {
+        StreamPipe { session_port, active_connection_manager, buf_size, src_stream, dst_stream }
     }
 
     pub async fn pipe_loop(&mut self) {
@@ -34,6 +38,7 @@ impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRe
 
         loop {
             tokio::select! {
+
               // handle src to dst pipe
               read_size = self.src_stream.read_buf(&mut src_to_dst_buf) => {
                 let size = match read_size {
@@ -46,7 +51,7 @@ impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRe
                     break;
                 }
 
-                self.active_connection_manager.incr_rx(self.session_port, size);
+                self.active_connection_manager.incr_tx(self.session_port, size);
                 self.dst_stream.write_buf(&mut src_to_dst_buf).await;
               },
 
@@ -65,7 +70,7 @@ impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRe
                     log::info!("**********src write close");
                     break;
                 }
-                self.active_connection_manager.incr_tx(self.session_port, size);
+                self.active_connection_manager.incr_rx(self.session_port, size);
                 self.src_stream.write_buf(&mut dst_to_src_buf).await;
               }
             }

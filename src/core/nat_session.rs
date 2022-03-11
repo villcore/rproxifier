@@ -118,3 +118,13 @@ impl InnerNatSessionManager {
         }
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    use crate::core::nat_session::NatSessionManager;
+
+    #[test]
+    pub fn test_get_now_time() {
+        println!("{}", NatSessionManager::get_now_time())
+    }
+}

@@ -42,6 +42,27 @@ impl ProxyServerConfigType {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ConnectionRouteRule {
+    pub hit_global_rule: bool,
+    pub hit_process_rule: bool,
+    pub need_proxy: bool,
+    pub host_regex: String,
+    pub route_rule: RouteRule,
+}
+
+impl ConnectionRouteRule {
+    pub fn get_copy(&self) -> ConnectionRouteRule {
+        ConnectionRouteRule {
+            hit_global_rule: self.hit_global_rule,
+            hit_process_rule: self.hit_process_rule,
+            need_proxy: self.need_proxy,
+            host_regex: self.host_regex.to_string(),
+            route_rule: self.route_rule.get_copy()
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub enum HostRouteStrategy {
     Direct,
 
@@ -52,6 +73,58 @@ pub enum HostRouteStrategy {
     Probe(bool, bool, String, Option<Ipv4Addr>, u64),
 
     Reject,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProcessRegexRouteRule {
+    pub process_path: String,
+    pub route_rule: RegexRouteRule,
+}
+
+impl ProcessRegexRouteRule {
+    pub fn get_route_rule(&self) -> RegexRouteRule {
+        self.route_rule.get_copy()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegexRouteRule {
+    pub host_regex: String,
+    pub route_rule: RouteRule
+}
+
+impl RegexRouteRule {
+    pub fn get_copy(&self) -> RegexRouteRule {
+        RegexRouteRule {
+            host_regex: self.host_regex.to_string(),
+            route_rule: self.route_rule.get_copy()
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RouteRule {
+
+    Direct,
+
+    // proxy_name
+    Proxy(String),
+
+    // proxy_name
+    Probe(String),
+
+    Reject,
+}
+
+impl RouteRule {
+    pub fn get_copy(&self) -> RouteRule {
+        match self {
+            RouteRule::Direct => RouteRule::Direct,
+            RouteRule::Proxy(proxy_name) => RouteRule::Proxy(proxy_name.to_string()),
+            RouteRule::Probe(proxy_name) => RouteRule::Probe(proxy_name.to_string()),
+            RouteRule::Reject => RouteRule::Reject
+        }
+    }
 }
 
 impl HostRouteStrategy {
@@ -97,6 +170,7 @@ impl ProxyServerConfigManager {
         let proxy_server_name = PROXY_SERVER_CONFIG_KEY_PREFIX.to_string() + name.as_str();
         match self.db.set(proxy_server_name.as_str(), proxy_server) {
             Ok(_) => {
+                let config_name = name.as_str();
                 if let Some(mut all_configs) = self.get_all_proxy_server_config_name() {
                     let already_exist_some_configs = all_configs.iter()
                         .filter(|&config| config.to_string() == name)
@@ -109,6 +183,9 @@ impl ProxyServerConfigManager {
                     } else {
                         log::info!("already set proxy server config {}", name)
                     }
+                } else {
+                    self.set_all_proxy_server_config(&vec![config_name.to_string()]);
+                    log::info!("set proxy server config {}", config_name)
                 }
             }
             Err(errors) => return Err(anyhow::anyhow!(format!("set {} proxy server config error, {}", name, errors.to_string())))
@@ -155,7 +232,7 @@ impl ProxyServerConfigManager {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::proxy_config_manager::{ProxyServerConfigManager, ProxyServerConfigType};
+    use crate::core::proxy_config_manager::{ProxyServerConfigManager, ProxyServerConfigType, RouteRule, RegexRouteRule};
     use std::sync::Arc;
     use crate::core::db::Db;
     use crate::core::proxy_config_manager::ProxyServerConfig;
@@ -177,6 +254,20 @@ mod tests {
         proxy_server_config_manager.set_proxy_server_config(config.get_copy());
         proxy_server_config_manager.set_proxy_server_config(config.get_copy());
         let config = proxy_server_config_manager.get_proxy_server_config("xperia");
-        log::info!("{:?}", config.unwrap());
+        log::info!("get 'xperia' proxy server config = {:?}", config.unwrap());
+        proxy_server_config_manager.remove_proxy_server_config("xperia");
+        log::info!("Remove 'xperia' proxy server config");
+
+        log::info!("get all proxy server config = {:?}", proxy_server_config_manager.get_all_proxy_server_config());
+    }
+
+    #[test]
+    pub fn test_serde_json() {
+        let h = RegexRouteRule {
+            host_regex: "123".to_string(),
+            route_rule: RouteRule::Proxy("xperia".to_string())
+        };
+
+        println!("{}", serde_json::to_string(&h).unwrap());
     }
 }

@@ -48,10 +48,10 @@ impl TunServer {
         };
 
         #[cfg(target_os="macos")]
-            setup_ip_route(&self.tun_name, &self.tun_ip, &self.tun_cidr);
+        setup_ip_route(&self.tun_name, &self.tun_ip, &self.tun_cidr);
 
         #[cfg(target_os="windows")]
-            let mut tun_socket = match tun::windows::TunSocket::new("rproxifier-tun") {
+        let mut tun_socket = match tun::windows::TunSocket::new("rproxifier-tun") {
             Ok(tun_socket) => tun_socket,
             Err(error) => {
                 log::error!("create windows tun error, {}", error.to_string());
@@ -61,7 +61,7 @@ impl TunServer {
 
         // windows sleep for a while
         #[cfg(target_os="windows")]
-            sleep(Duration::from_secs(5));
+        sleep(Duration::from_secs(5));
 
         stared_event_sender.send(true);
         let relay_addr = self.relay_addr;

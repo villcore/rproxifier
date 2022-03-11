@@ -110,6 +110,17 @@ fn get_primary_network() -> String {
     }
 }
 
+pub fn get_gateway() -> String {
+    let route_ret = run_cmd("route", &["-n", "get", "0.0.0.0"]);
+    let device = route_ret
+        .lines()
+        .find(|l| l.contains("gateway:"))
+        .and_then(|l| l.split_whitespace().last())
+        .map(|s| s.trim())
+        .expect("get primary device");
+    return device.to_string();
+}
+
 fn get_original_dns(dns: &str) -> Vec<String> {
     let network = get_primary_network();
     info!("Primary netowrk service is {}", &network);
