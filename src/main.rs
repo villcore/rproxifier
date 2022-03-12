@@ -41,7 +41,7 @@ use crate::sys::sys::DNSSetup;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use sled::IVec;
-use sysinfo::{SystemExt, ProcessExt, PidExt, Process};
+use sysinfo::{SystemExt, ProcessExt, PidExt, Process, NetworkExt};
 use crate::core::host_route_manager::HostRouteManager;
 use crate::core::proxy_config_manager::{HostRouteStrategy, ProxyServerConfigManager, ProxyServerConfig, ProxyServerConfigType, RegexRouteRule, ProcessRegexRouteRule};
 use crate::core::active_connection_manager::ActiveConnectionManager;
@@ -59,54 +59,24 @@ fn main() {
     setup_log();
     let db = Arc::new(core::db::Db::new("data/db"));
     let mut network = Arc::new(NetworkModule::new("", 10000, db.clone()));
-
-    // setup proxy server config
-    network.proxy_server_config_manager.set_proxy_server_config(ProxyServerConfig {
-        name: "xperia5".to_string(),
-        config: ProxyServerConfigType::SocksV5("192.168.50.58".to_string(), 10808, "".to_string(), "".to_string()),
-        available: false
-    });
-
     let app = Arc::new(App::new(network));
+    app.clear_dns();
     app.start();
 
     let app_cpy = app.clone();
-    rouille::start_server("localhost:8000", move |request| {
+    rouille::start_server("0.0.0.0:18000", move |request| {
         rouille::router!(request,
-            (GET) (/) => {
-                rouille::Response::redirect_302("/hello/world")
-            },
-
-            (GET) (/hello/world) => {
-                println!("hello world");
-                rouille::Response::text("hello world")
-            },
-
-            (GET) (/panic) => {
-                panic!("Oops!")
-            },
-
-            (GET) (/{id: u32}) => {
-                println!("u32 {:?}", id);
-                rouille::Response::empty_400()
-            },
-
-            (GET) (/{id: String}) => {
-                println!("String {:?}", id);
-                rouille::Response::text(format!("hello, {}", id))
-            },
-
-            (GET) (/net/get_net_state) => {
+            (POST) (/net/start_net) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let start_network: NetworkInterface = serde_json::from_reader(request_body).unwrap();
+                app_cpy.setup_dns_with_primary_ip(start_network.interface_name);
                 rouille::Response::json(&true)
             },
 
-            (GET) (/net/start_net_state) => {
-                app_cpy.setup_dns();
-                rouille::Response::json(&true)
-            },
-
-            (GET) (/net/stop_net_state) => {
-                app_cpy.clear_dns();
+            (POST) (/net/stop_net) => {
+               let request_body: rouille::RequestBody = request.data().unwrap();
+                let start_network: NetworkInterface = serde_json::from_reader(request_body).unwrap();
+                app_cpy.clear_dns_with_primary_ip(start_network.interface_name);
                 rouille::Response::json(&true)
             },
 
@@ -244,6 +214,25 @@ fn main() {
                 rouille::Response::json(&true)
             },
 
+            (GET) (/overview/network) => {
+                let app = app_cpy.network_module.clone();
+                let interfaces = app.clone().system_manager.get_network_interface().unwrap_or_else(||vec![]);
+                let network_state = app.clone().dns_config_manager.get_local_dns_state();
+                let bind_dns_interface = &app.clone().dns_config_manager.bind_dns_interface;
+                rouille::Response::json(&api::NetworkOverview{
+                    interface_list: interfaces,
+                    network_state: network_state,
+                    bind_interface: bind_dns_interface.get_copy()
+                })
+            },
+
+            (GET) (/process/get_all_process) => {
+                let process_query = request.get_param("process_query").unwrap_or_else(||"".to_string());
+                let app = app_cpy.network_module.clone();
+                let process_vec = app.system_manager.get_all_process(process_query);
+                rouille::Response::json(&process_vec)
+            },
+
             _ => rouille::Response::empty_404()
         )
     });
@@ -278,9 +267,27 @@ impl App {
         self.network_module.setup_dns();
     }
 
+    pub fn setup_dns_with_primary_ip(&self, primary_ip: String) {
+        if primary_ip.is_empty() {
+            self.setup_dns()
+        } else {
+            log::info!("set up dns with primary ip {}", primary_ip);
+            self.network_module.setup_dns_with_interface_name(primary_ip);
+        }
+    }
+
     pub fn clear_dns(&self) {
         log::info!("clear dns");
         self.network_module.clear_dns();
+    }
+
+    pub fn clear_dns_with_primary_ip(&self, primary_ip: String) {
+        if primary_ip.is_empty() {
+            self.network_module.clear_dns();
+        } else {
+            log::info!("clear dns with primary ip {}", primary_ip);
+            self.network_module.clear_dns_with_interface_name(primary_ip);
+        }
     }
 
     pub fn clone(&self) -> App {
@@ -300,7 +307,7 @@ pub struct NetworkModule {
     pub fake_ip_manager: Arc<FakeIpManager>,
     pub proxy_server_config_manager: Arc<ProxyServerConfigManager>,
     pub active_connection_manager: Arc<ActiveConnectionManager>,
-    pub process_manager: Arc<ProcessManager>,
+    pub system_manager: Arc<SystemManager>,
     pub dns_config_manager: Arc<DnsConfigManager>,
 }
 
@@ -315,7 +322,7 @@ impl NetworkModule {
             fake_ip_manager: Arc::new(FakeIpManager::new((10, 0, 0, 100))),
             proxy_server_config_manager: Arc::new(ProxyServerConfigManager::new(db.clone())),
             active_connection_manager: Arc::new(Default::default()),
-            process_manager: Arc::new(ProcessManager { system: Default::default() }),
+            system_manager: Arc::new(SystemManager { system: Default::default() }),
             dns_config_manager: Arc::new(DnsConfigManager::new(db.clone()))
         }
     }
@@ -330,8 +337,19 @@ impl NetworkModule {
         self.dns_config_manager.mark_local_dns_start();
     }
 
+    pub fn setup_dns_with_interface_name(&self, interface_name: String) {
+        log::info!("setup run dns server, listen at {}", self.dns_listen);
+        self.dns_setup.set_dns_with_primary_interface_name(interface_name);
+        self.dns_config_manager.mark_local_dns_start();
+    }
+
     pub fn clear_dns(&self) {
         self.dns_setup.clear_dns();
+        self.dns_config_manager.mark_local_dns_stop();
+    }
+
+    pub fn clear_dns_with_interface_name(&self, interface_name: String) {
+        self.dns_setup.clear_dns_with_interface_name(interface_name);
         self.dns_config_manager.mark_local_dns_stop();
     }
 
@@ -352,7 +370,7 @@ impl NetworkModule {
         let host_route_manager = self.host_route_manager.clone();
         let proxy_server_config_manager = self.proxy_server_config_manager.clone();
         let active_connection_manager = self.active_connection_manager.clone();
-        let process_manager = self.process_manager.clone();
+        let process_manager = self.system_manager.clone();
         let dns_config_manager = self.dns_config_manager.clone();
 
         // start tun_server
@@ -397,7 +415,7 @@ impl NetworkModule {
                                host_route_manager: Arc<HostRouteManager>,
                                proxy_server_config_manager: Arc<ProxyServerConfigManager>,
                                active_connection_manager: Arc<ActiveConnectionManager>,
-                               process_manager: Arc<ProcessManager>,
+                               process_manager: Arc<SystemManager>,
                                dns_config_manager: Arc<DnsConfigManager>) {
 
         log::info!("run async component");
@@ -538,11 +556,11 @@ impl ProcessInfo {
     }
 }
 
-pub struct ProcessManager {
+pub struct SystemManager {
     pub system: sysinfo::System,
 }
 
-impl ProcessManager {
+impl SystemManager {
 
     pub fn new() -> Self {
         Self {
@@ -590,6 +608,71 @@ impl ProcessManager {
             Err(_) => {
                 None
             }
+        }
+    }
+
+    pub fn get_network_interface(&self) -> Option<Vec<NetworkInterface>> {
+        match local_ip_address::list_afinet_netifas() {
+            Ok(vec) => {
+                for (interface, ip) in vec {
+                    #[cfg(target_os = "macos")]
+                    if matches!(ip, IpAddr::V4(_)) && interface != "lo0"{
+                        return Some(vec![NetworkInterface{
+                            interface_name: interface,
+                            ip_addr: ip.to_string()
+                        }])
+                    }
+                }
+            }
+            Err(errors) => {
+                log::error!("get network interface error")
+            }
+        }
+        None
+    }
+
+    pub fn get_all_process(&self, match_str: String) -> Vec<ProcessInfo> {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes();
+
+        system.processes().into_iter()
+            .map(|(pid, process)|{
+                let process_name = process.name().to_string();
+                let cmd = {
+                    if process.cmd().len() > 0 {
+                        process.cmd()[0].to_string()
+                    } else {
+                        "".to_string()
+                    }
+                };
+
+                if process_name.contains(&match_str) || cmd.contains(&match_str) {
+                    Some(ProcessInfo {
+                        pid: pid.as_u32(),
+                        process_name: process.name().to_string(),
+                        process_execute_path: cmd
+                    })
+                } else {
+                    None
+                }
+            })
+            .filter(Option::is_some)
+            .map(Option::unwrap)
+            .collect()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NetworkInterface {
+    pub interface_name: String,
+    pub ip_addr: String,
+}
+
+impl NetworkInterface {
+    pub fn get_copy(&self) -> NetworkInterface {
+        NetworkInterface {
+            interface_name: self.interface_name.to_string(),
+            ip_addr: self.ip_addr.to_string()
         }
     }
 }

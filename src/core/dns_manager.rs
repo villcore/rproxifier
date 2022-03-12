@@ -3,7 +3,7 @@ use async_std_resolver::AsyncStdResolver;
 use serde::{Serialize, Deserialize};
 use crate::dns::resolve::{ConfigDnsResolver, FakeIpManager};
 use crate::dns::server::DnsUdpServer;
-use crate::dns;
+use crate::{dns, NetworkInterface};
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::core::db::Db;
 
@@ -66,6 +66,7 @@ pub const DNS_HOST_CONFIG_KEY_PREFIX: &str = "DNS_H_";
 pub struct DnsConfigManager {
     pub db: Arc<Db>,
     pub local_dns_started: AtomicBool,
+    pub bind_dns_interface: NetworkInterface
 }
 
 impl DnsConfigManager {
@@ -73,7 +74,11 @@ impl DnsConfigManager {
     pub fn new(db: Arc<Db>) -> Self {
         Self {
             db,
-            local_dns_started: AtomicBool::new(false)
+            local_dns_started: AtomicBool::new(false),
+            bind_dns_interface: NetworkInterface{
+                interface_name: "".to_string(),
+                ip_addr: "".to_string()
+            }
         }
     }
     

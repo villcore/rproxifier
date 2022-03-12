@@ -8,7 +8,7 @@ use tokio::net::{TcpStream, TcpListener};
 use crate::core::StreamPipe;
 use crate::core::host_route_manager::HostRouteManager;
 use crate::core::proxy_config_manager::{HostRouteStrategy, ProxyServerConfig, ProxyServerConfigType, ConnectionRouteRule, RouteRule};
-use crate::{ProxyServerConfigManager, ProcessManager, ProcessInfo};
+use crate::{ProxyServerConfigManager, SystemManager, ProcessInfo};
 use crate::core::active_connection_manager::{ActiveConnectionManager, ActiveConnection};
 use crate::core::dns_manager::DnsConfigManager;
 
@@ -19,7 +19,7 @@ pub struct TcpRelayServer {
     pub host_route_manager: Arc<HostRouteManager>,
     pub proxy_server_config_manager: Arc<ProxyServerConfigManager>,
     pub active_connection_manager: Arc<ActiveConnectionManager>,
-    pub process_manager: Arc<ProcessManager>,
+    pub process_manager: Arc<SystemManager>,
     pub dns_config_manager: Arc<DnsConfigManager>,
     pub listen_addr: (u8, u8, u8, u8),
     pub listen_port: u16,

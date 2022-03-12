@@ -1,6 +1,7 @@
 use crate::core::proxy_config_manager::{ProxyServerConfigType, ProxyServerConfig, RouteRule};
 use serde::{Serialize, Deserialize};
 use crate::core::dns_manager::DnsHost;
+use crate::NetworkInterface;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProxyServerConfigResponse {
@@ -67,4 +68,11 @@ impl GetDnsConfigResponse {
             all_dns_config
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NetworkOverview {
+    pub interface_list: Vec<NetworkInterface>,
+    pub network_state: bool,
+    pub bind_interface: NetworkInterface
 }
