@@ -66,14 +66,25 @@ impl DNSSetup {
                 );
             }
         } else {
-            // match interfaces::Interface::get_all() {
-            //     Ok(interface_vec) => {
-            //         for i in interface_vec {
-            //             log::info!("<<<<<<<<<<<<<<<<<<<<<<<<<<< {}", i.name)
-            //         }
-            //     }
-            //     Err(_) => {}
-            // }
+            // TODO: setup_ip()
+            let output = Command::new("netsh")
+                .arg("interface")
+                .arg("ip")
+                .arg("set")
+                .arg("dns")
+                .arg("name=".to_string() + interface_name.as_str())
+                .arg("source=static")
+                .arg("addr=127.0.0.1")
+                .output();
+            log::info!(">>>>>>>>>>>>> command = {:?}", output);
+            match output {
+                Ok(status) => {
+                    log::info!("set interface dns result is {}", status.status)
+                }
+                Err(err) => {
+                    log::info!("set interface dns error: {}", err.to_string())
+                }
+            }
         }
     }
 

@@ -52,7 +52,6 @@ mod dns;
 mod sys;
 mod tun;
 mod core;
-mod pb;
 mod api;
 
 fn main() {
@@ -429,16 +428,18 @@ impl NetworkModule {
             }
         };
         run_time.block_on(async {
-
+            log::info!("1>>>>>>>>>>>>>>>>>>>>1start run dns sever");
             // dns resolver
             let resolver_config = self.default_resolver_config();
             let resolver_opts = self.default_resolver_opts();
             let resolver = async_std_resolver::resolver(resolver_config, resolver_opts).await.expect("failed to connect resolver");
+            log::info!("2>>>>>>>>>>>>>>>>>>>>1start run dns sever");
 
             // forward dns resolver
             let forward_resolver_config = self.forward_resolver_config();
             let forward_resolver_opts = self.default_resolver_opts();
             let forward_resolver = async_std_resolver::resolver(forward_resolver_config, forward_resolver_opts).await.expect("failed to connect resolver");
+            log::info!("3>>>>>>>>>>>>>>>>>1start run dns sever");
 
             // dns server
             let dns_server = DnsManager {
@@ -507,7 +508,12 @@ impl NetworkModule {
     }
 
     fn forward_resolver_config(&self) -> ResolverConfig {
+
+        #[cfg(target_os="macos")]
         let gateway_addr = get_gateway();
+
+        #[cfg(target_os="windows")]
+        let gateway_addr = "192.168.0.1".to_string();
         let num_concurrent_reqs = 3;
         let mut name_server_config_group = NameServerConfigGroup::with_capacity(num_concurrent_reqs);
         name_server_config_group.push(
@@ -576,6 +582,7 @@ impl SystemManager {
         return match system.process(pid) {
             None => None,
             Some(process) => {
+                #[cfg(target_os="macos")]
                 let cmd = {
                     if process.cmd().len() > 0 {
                         process.cmd()[0].to_string()
@@ -584,9 +591,11 @@ impl SystemManager {
                     }
                 };
 
+                #[cfg(target_os="windows")]
+                let cmd = process.exe().to_str().unwrap_or_else(||"").to_string();
                 Some(ProcessInfo {
                     pid: pid_num,
-                    process_name: process.name().to_string(),
+                    process_name: cmd.to_string(),
                     process_execute_path: cmd
                 })
             }
@@ -605,7 +614,7 @@ impl SystemManager {
                 }
                 None
             }
-            Err(_) => {
+            Err(errors) => {
                 None
             }
         }
@@ -614,15 +623,25 @@ impl SystemManager {
     pub fn get_network_interface(&self) -> Option<Vec<NetworkInterface>> {
         match local_ip_address::list_afinet_netifas() {
             Ok(vec) => {
+                let mut interface_vec = vec![];
                 for (interface, ip) in vec {
                     #[cfg(target_os = "macos")]
                     if matches!(ip, IpAddr::V4(_)) && interface != "lo0"{
-                        return Some(vec![NetworkInterface{
+                        interface_vec.push(NetworkInterface{
                             interface_name: interface,
                             ip_addr: ip.to_string()
-                        }])
+                        })
+                    }
+
+                    #[cfg(target_os = "windows")]
+                    if matches!(ip, IpAddr::V4(_)) && interface != "rproxifier-tun" {
+                        interface_vec.push(NetworkInterface{
+                            interface_name: interface,
+                            ip_addr: ip.to_string()
+                        });
                     }
                 }
+                return Some(interface_vec)
             }
             Err(errors) => {
                 log::error!("get network interface error")

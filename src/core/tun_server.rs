@@ -5,6 +5,7 @@ use crate::core::nat_session::NatSessionManager;
 use std::str::FromStr;
 use crate::sys::sys::setup_ip_route;
 use crate::tun;
+use std::thread::sleep;
 use std::thread::spawn;
 use std::time::Duration;
 use std::io::{Read, Write};
