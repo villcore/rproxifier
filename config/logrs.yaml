@@ -1,7 +1,7 @@
 refresh_rate: 30 seconds
 appenders:
   stdout:
-    kind: file
+    kind: "log/rproxifier_out.log"
   requests:
     kind: file
     path: "log/rproxifier.log"
