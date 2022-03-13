@@ -68,14 +68,14 @@ fn main() {
             (POST) (/net/start_net) => {
                 let request_body: rouille::RequestBody = request.data().unwrap();
                 let start_network: NetworkInterface = serde_json::from_reader(request_body).unwrap();
-                app_cpy.setup_dns_with_primary_ip(start_network.interface_name);
+                app_cpy.setup_dns_with_primary_ip(start_network);
                 rouille::Response::json(&true)
             },
 
             (POST) (/net/stop_net) => {
                let request_body: rouille::RequestBody = request.data().unwrap();
                 let start_network: NetworkInterface = serde_json::from_reader(request_body).unwrap();
-                app_cpy.clear_dns_with_primary_ip(start_network.interface_name);
+                app_cpy.clear_dns_with_primary_ip(start_network);
                 rouille::Response::json(&true)
             },
 
@@ -200,9 +200,11 @@ fn main() {
                 } else {
                     ""
                 };
-                let gateway = get_gateway();
+
+                let mut bind_network_interface = app.bind_network_interface.lock().unwrap();
+                let gateway = bind_network_interface.ip_addr.clone();
                 let all_dns_host: Vec<DnsHost> = app.dns_config_manager.get_all_host_contains(dns_query);
-                rouille::Response::json(&api::GetDnsConfigResponse::new(local_dns_server.to_string(), gateway.to_string(), all_dns_host))
+                rouille::Response::json(&api::GetDnsConfigResponse::new(local_dns_server.to_string(), gateway, all_dns_host))
             },
 
             (POST) (/dns/set_dns_config) => {
@@ -217,7 +219,7 @@ fn main() {
                 let app = app_cpy.network_module.clone();
                 let interfaces = app.clone().system_manager.get_network_interface().unwrap_or_else(||vec![]);
                 let network_state = app.clone().dns_config_manager.get_local_dns_state();
-                let bind_dns_interface = &app.clone().dns_config_manager.bind_dns_interface;
+                let bind_dns_interface = &app.clone().bind_network_interface.lock().unwrap().get_copy();
                 rouille::Response::json(&api::NetworkOverview{
                     interface_list: interfaces,
                     network_state: network_state,
@@ -266,7 +268,13 @@ impl App {
         self.network_module.setup_dns();
     }
 
-    pub fn setup_dns_with_primary_ip(&self, primary_ip: String) {
+    pub fn setup_dns_with_primary_ip(&self, network_interface: NetworkInterface) {
+        let mut bind_network_interface = self.network_module.bind_network_interface.lock().unwrap();
+        bind_network_interface.ip_addr = network_interface.ip_addr.clone();
+        bind_network_interface.interface_name = network_interface.interface_name.clone();
+        log::info!("setup dns with interface {:?}", network_interface.get_copy());
+
+        let primary_ip = network_interface.interface_name;
         if primary_ip.is_empty() {
             self.setup_dns()
         } else {
@@ -280,7 +288,11 @@ impl App {
         self.network_module.clear_dns();
     }
 
-    pub fn clear_dns_with_primary_ip(&self, primary_ip: String) {
+    pub fn clear_dns_with_primary_ip(&self, network_interface: NetworkInterface) {
+        let mut bind_network_interface = self.network_module.bind_network_interface.lock().unwrap();
+        bind_network_interface.ip_addr = "".to_string();
+        bind_network_interface.interface_name = "".to_string();
+        let primary_ip = network_interface.interface_name.to_string();
         if primary_ip.is_empty() {
             self.network_module.clear_dns();
         } else {
@@ -308,6 +320,7 @@ pub struct NetworkModule {
     pub active_connection_manager: Arc<ActiveConnectionManager>,
     pub system_manager: Arc<SystemManager>,
     pub dns_config_manager: Arc<DnsConfigManager>,
+    pub bind_network_interface: Arc<Mutex<NetworkInterface>>,
 }
 
 impl NetworkModule {
@@ -322,7 +335,8 @@ impl NetworkModule {
             proxy_server_config_manager: Arc::new(ProxyServerConfigManager::new(db.clone())),
             active_connection_manager: Arc::new(Default::default()),
             system_manager: Arc::new(SystemManager { system: Default::default() }),
-            dns_config_manager: Arc::new(DnsConfigManager::new(db.clone()))
+            dns_config_manager: Arc::new(DnsConfigManager::new(db.clone())),
+            bind_network_interface: Arc::new(Mutex::new(NetworkInterface { interface_name: "".to_string(), ip_addr: "".to_string()}))
         }
     }
 
@@ -428,18 +442,15 @@ impl NetworkModule {
             }
         };
         run_time.block_on(async {
-            log::info!("1>>>>>>>>>>>>>>>>>>>>1start run dns sever");
             // dns resolver
             let resolver_config = self.default_resolver_config();
             let resolver_opts = self.default_resolver_opts();
             let resolver = async_std_resolver::resolver(resolver_config, resolver_opts).await.expect("failed to connect resolver");
-            log::info!("2>>>>>>>>>>>>>>>>>>>>1start run dns sever");
 
             // forward dns resolver
             let forward_resolver_config = self.forward_resolver_config();
             let forward_resolver_opts = self.default_resolver_opts();
             let forward_resolver = async_std_resolver::resolver(forward_resolver_config, forward_resolver_opts).await.expect("failed to connect resolver");
-            log::info!("3>>>>>>>>>>>>>>>>>1start run dns sever");
 
             // dns server
             let dns_server = DnsManager {
@@ -634,7 +645,7 @@ impl SystemManager {
                     }
 
                     #[cfg(target_os = "windows")]
-                    if matches!(ip, IpAddr::V4(_)) && interface != "rproxifier-tun" {
+                    if matches!(ip, IpAddr::V4(_)) && interface != "rproxifier-tun" && !interface.contains("Loopback") {
                         interface_vec.push(NetworkInterface{
                             interface_name: interface,
                             ip_addr: ip.to_string()

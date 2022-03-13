@@ -72,11 +72,10 @@ impl DNSSetup {
                 .arg("ip")
                 .arg("set")
                 .arg("dns")
-                .arg("name=".to_string() + interface_name.as_str())
-                .arg("source=static")
-                .arg("addr=127.0.0.1")
+                .arg(interface_name.as_str())
+                .arg("static")
+                .arg("127.0.0.1")
                 .output();
-            log::info!(">>>>>>>>>>>>> command = {:?}", output);
             match output {
                 Ok(status) => {
                     log::info!("set interface dns result is {}", status.status)
@@ -122,7 +121,23 @@ impl DNSSetup {
             info!("Restore original DNS: {:?}", original_dns);
             let _ = run_cmd("networksetup", &args);
         } else {
-            // TODO: windows
+            // windows
+            let output = Command::new("netsh")
+                .arg("interface")
+                .arg("ip")
+                .arg("set")
+                .arg("dnsserver")
+                .arg(interface_name.as_str())
+                .arg("dhcp")
+                .output();
+            match output {
+                Ok(status) => {
+                    log::info!("set interface dns result is {}", status.status)
+                }
+                Err(err) => {
+                    log::info!("set interface dns error: {}", err.to_string())
+                }
+            }
         }
     }
 }
