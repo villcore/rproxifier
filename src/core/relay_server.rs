@@ -4,13 +4,14 @@ use crate::dns::resolve::{FakeIpManager, resolve_host};
 use crate::core::nat_session::NatSessionManager;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::time::Duration;
-use tokio::net::{TcpStream, TcpListener};
+use tokio::net::{TcpStream, TcpListener, UdpSocket};
 use crate::core::StreamPipe;
 use crate::core::host_route_manager::HostRouteManager;
 use crate::core::proxy_config_manager::{HostRouteStrategy, ProxyServerConfig, ProxyServerConfigType, ConnectionRouteRule, RouteRule};
 use crate::{ProxyServerConfigManager, SystemManager, ProcessInfo};
 use crate::core::active_connection_manager::{ActiveConnectionManager, ActiveConnection};
 use crate::core::dns_manager::DnsConfigManager;
+use std::io::Error;
 
 pub struct TcpRelayServer {
     pub resolver: Arc<AsyncStdResolver>,
@@ -29,6 +30,8 @@ impl TcpRelayServer {
 
     pub async fn run(&self) {
         self.run_session_port_recycler();
+
+       self.run_udp_server();
 
         // bind address
         self.run_tcp_server().await;
@@ -299,6 +302,92 @@ impl TcpRelayServer {
                 });
             }
         }
+    }
+
+    fn run_udp_server(&self) {
+        // tokio::spawn(async {
+        //     let net_session_manager = self.nat_session_manager.clone();
+        //     let udp_listener = UdpSocket::bind("0.0.0.0:1300").await;
+        // });
+        // let net_session_manager = self.nat_session_manager.clone();
+        // let mut nat_session_manager = match net_session_manager.lock() {
+        //     Ok(nat_session_manager) => nat_session_manager,
+        //     Err(errors) => {
+        //         log::error!("get nat session manager error, {}", errors);
+        //         return
+        //     }
+        // };
+        //
+        // let resolver = self.resolver.clone();
+        // let fake_ip_manager = self.fake_ip_manager.clone();
+        // let host_route_manager = self.host_route_manager.clone();
+        // let proxy_server_config_manager = self.proxy_server_config_manager.clone();
+        // let active_connection_manager = self.active_connection_manager.clone();
+        // let mut process_manager = self.process_manager.clone();
+        // let dns_config_manager = self.dns_config_manager.clone();
+
+        // udp server.
+        // let udp_listener = match UdpSocket::bind("0.0.0.0:1300").await {
+        //     Ok(udp_socket) => {
+        //         Arc::new(udp_socket)
+        //     }
+        //     Err(errors) => {
+        //         log::error!("bind udp socket error, {}", errors.to_string());
+        //         return
+        //     }
+        // };
+
+        // let mut buf = vec![0; 4090];
+        //
+        // loop {
+        //     let (size, peer_addr) = match udp_listener.recv_from(&mut buf).await {
+        //         Ok(result) => result,
+        //         Err(errors) => {
+        //             log::error!("rece form udp socket error, {}", errors.to_string());
+        //             return
+        //         }
+        //     };
+            // let session_port = peer_addr.port();
+            // let (src_addr, src_port, dst_addr, dst_port)= match nat_session_manager.get_port_session_tuple(session_port) {
+            //     None => {
+            //         log::error!("get session port {} udp session tuple error ", session_port);
+            //         return;
+            //     }
+            //     Some(r) => r,
+            // };
+            //
+            // let dst_addr_bytes = dst_addr.octets();
+            // let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
+            // let origin_host_port = match fake_ip_manager.get_host(&fake_ip) {
+            //     None => {
+            //         log::error!("get host from fake_ip {} error", dst_addr.to_string());
+            //         return
+            //     }
+            //
+            //     Some(host) => (host, dst_port)
+            // };
+            //
+            // let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver.clone(), fake_ip_manager.clone()).await {
+            //     None => {
+            //         log::error!("get udp socket dst addr error");
+            //         return
+            //     }
+            //
+            //     Some(result) => result
+            // };
+            //
+            // log::info!(">>>>>>>>>>>>>>>> udp dst addr = {}:{}", direct_address_port.0, direct_address_port.1);
+            // let dst_udp_socket: UdpSocket;
+            // dst_udp_socket.send_to(&buf[..size], ).await;
+            //
+            // match timeout(write_timeout, socket.send_to(&buf[..size], dest_addr)).await {
+            //     Ok(send_size) => {
+            //         assert_eq!(size, send_size);
+            //     }
+            //     Err(e) => error!(?e, "send to {}", dest_addr),
+            // };
+            // self.session_manager.update_activity_for_port(session_port);
+        // }
     }
 
     fn add_active_connection(session_port: u16, src_addr: Ipv4Addr, src_port: u16, dst_port: u16,
