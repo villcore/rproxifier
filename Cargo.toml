@@ -36,6 +36,9 @@ sysinfo = "0.23.5"
 netstat2 = "0.9.1"
 async-speed-limit = "0.4.0"
 local-ip-address = "0.4.4"
+windivert = "0.4.0"
+windivert-sys = "0.8.0"
+dns-parser = "0.8.0"
 
 [target.'cfg(any(target_os = "macos"))'.dependencies]
 smoltcp = { version = "0.8.0", default-features = false, features = ["proto-ipv6", "proto-ipv4", "std"] }
@@ -66,3 +69,6 @@ sysinfo = "0.23.5"
 netstat2 = "0.9.1"
 async-speed-limit = "0.4.0"
 local-ip-address = "0.4.4"
+windivert = "0.4.0"
+windivert-sys = "0.8.0"
+dns-parser = "0.8.0"
