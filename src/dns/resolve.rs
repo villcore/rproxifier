@@ -415,6 +415,11 @@ impl FakeIpManager {
             }
         }
     }
+
+    pub fn set_host_ip(&self, host: &str, ip: (u8, u8, u8, u8)) {
+        let inner_write = self.inner.lock().unwrap();
+        inner_write.set_host_ip(host, ip);
+    }
 }
 
 pub struct InnerFakeIpManager {
@@ -470,6 +475,11 @@ impl InnerFakeIpManager {
         self.next_fake_ip_seq.fetch_add(1, Ordering::SeqCst);
         let a = next_fake_ip_seq.to_be_bytes();
         (a[0], a[1], a[2], a[3])
+    }
+
+    fn set_host_ip(&self, host: &str, ip: (u8, u8, u8, u8)) {
+        self.host_to_fake_ip.insert(host.to_string(), ip);
+        self.fake_ip_to_host.insert(ip, host.to_string());
     }
 
     fn remove_host(&mut self) {
