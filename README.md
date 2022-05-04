@@ -1,9 +1,9 @@
 # rproxifier
-一个rust编写的类似Proxifier全局TCP路由的流量转发软件
+一个rust编写的类似Proxifier全局TCP路由的流量转发软件，仅作练习学习，功能基本完善
 
 ### 工作原理
-##### macos使用了tun + fakeIp 的方式实现（master分支）
-##### windows使用了两种方式实现
+#### macos使用了tun + fakeIp 的方式实现（master分支）
+#### windows使用了两种方式实现
 * 1. wintun + fakeIp (master分支)
 * 2. windivert流量过滤方式实现（windows分支）
 
