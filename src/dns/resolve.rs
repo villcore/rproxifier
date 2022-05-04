@@ -24,6 +24,7 @@ use dashmap::mapref::one::Ref;
 use std::sync::atomic::{Ordering, AtomicU32};
 use tokio::sync::RwLock;
 use std::sync::{Arc, Mutex};
+use crate::core::dns_manager::{DnsManager, DnsConfigManager, DnsHost};
 
 #[async_trait]
 pub trait DnsResolver {
@@ -322,43 +323,10 @@ impl DnsResolver for DirectDnsResolver {
     }
 }
 
-pub enum UserConfigDnsType {
-
-    /// 正则表达式，模糊匹配
-    Regex(String, RelayPolicy),
-
-    /// 普通文本，精确匹配
-    PlanText(String, RelayPolicy),
-
-    /// 包含匹配
-    ContainsText(String, RelayPolicy),
-
-    /// 默认规则，以上规则无法命中时默认规则
-    Default(RelayPolicy)
-}
-
-/// 转发策略
-pub enum RelayPolicy {
-
-    /// 直接连接
-    Direct,
-
-    /// 代理连接
-    Proxy(Ipv4Addr, u16),
-
-    ///
-
-    /// 拒绝访问
-    Reject,
-
-    /// 探测
-    Probe(Box<RelayPolicy>)
-}
-
 pub struct UserConfigDnsResolver {
     domain_map: HashMap<String, Ipv4Addr>,
     ip_addr_map: HashMap<Ipv4Addr, String>,
-    wrap_resolver:  Box<dyn DnsResolver + Sync + Send>
+    wrap_resolver:  Box<dyn DnsResolver + Sync + Send>,
 }
 
 impl UserConfigDnsResolver {
@@ -514,16 +482,25 @@ impl InnerFakeIpManager {
 }
 
 pub struct ConfigDnsResolver {
+    dns_config_manager: Arc<DnsConfigManager>,
     fake_ip_manager: Arc<FakeIpManager>,
-    async_std_resolver: AsyncStdResolver
+    async_std_resolver: AsyncStdResolver,
+    local_resolver: AsyncStdResolver
+
 }
 
 impl ConfigDnsResolver {
 
-    pub fn new(fake_ip_manager: Arc<FakeIpManager>, async_std_resolver: AsyncStdResolver) -> Self {
+    pub fn new(dns_config_manager: Arc<DnsConfigManager>,
+               fake_ip_manager: Arc<FakeIpManager>,
+               async_std_resolver: AsyncStdResolver,
+               local_resolver: AsyncStdResolver) -> Self {
+
         Self {
+            dns_config_manager,
             fake_ip_manager,
-            async_std_resolver
+            async_std_resolver,
+            local_resolver
         }
     }
 
@@ -548,7 +525,7 @@ impl ConfigDnsResolver {
                                 DnsRecord::A {
                                     domain: qname.to_string(),
                                     addr: *ip,
-                                    ttl: TransientTtl(r.ttl()),
+                                    ttl: TransientTtl(30),
                                 }
                             }
 
@@ -556,7 +533,7 @@ impl ConfigDnsResolver {
                                 DnsRecord::AAAA {
                                     domain: qname.to_string(),
                                     addr: *ip,
-                                    ttl: TransientTtl(r.ttl()),
+                                    ttl: TransientTtl(30),
                                 }
                             }
                             _ => {
@@ -564,7 +541,62 @@ impl ConfigDnsResolver {
                                     domain: qname.to_string(),
                                     qtype: 0,
                                     data_len: 0,
-                                    ttl: TransientTtl(r.ttl()),
+                                    ttl: TransientTtl(30),
+                                }
+                            }
+                        }
+                    })
+                    .filter(|dns_record| {
+                        match dns_record {
+                            DnsRecord::UNKNOWN { .. } => {
+                                false
+                            }
+                            _ => {
+                                true
+                            }
+                        }
+                    })
+                    .collect();
+                let mut dns_packet = DnsPacket::new();
+                dns_packet.answers.append(&mut dns_records);
+                Ok(dns_packet)
+            }
+
+            Err(e) => {
+                tracing::error!("!!! Resolve host [{}] error, msg: {} ", qname, e.to_string());
+                Err(io::Error::new(io::ErrorKind::Other, e))
+            }
+        }
+    }
+
+    pub async fn resolve_host_forward(&self, qname: &str) -> Result<DnsPacket> {
+        match self.local_resolver.lookup_ip(qname).await {
+            Ok(lookup_result) => {
+                let mut dns_records: Vec<DnsRecord> = lookup_result.as_lookup().record_iter()
+                    .map(|r| {
+                        let rd = r.rdata();
+                        match rd {
+                            RData::A(ip) => {
+                                DnsRecord::A {
+                                    domain: qname.to_string(),
+                                    addr: *ip,
+                                    ttl: TransientTtl(30),
+                                }
+                            }
+
+                            RData::AAAA(ip) => {
+                                DnsRecord::AAAA {
+                                    domain: qname.to_string(),
+                                    addr: *ip,
+                                    ttl: TransientTtl(30),
+                                }
+                            }
+                            _ => {
+                                DnsRecord::UNKNOWN {
+                                    domain: qname.to_string(),
+                                    qtype: 0,
+                                    data_len: 0,
+                                    ttl: TransientTtl(30),
                                 }
                             }
                         }
@@ -596,12 +628,23 @@ impl ConfigDnsResolver {
 #[async_trait]
 impl DnsResolver for ConfigDnsResolver {
     async fn resolve(&self, qname: &str, qtype: QueryType, recursive: bool) -> Result<DnsPacket> {
+        if let Some(dns_host) = self.dns_config_manager.get_host(qname) {
+            if dns_host.reverse_resolve {
+                // 向网关请求解析
+                return self.resolve_host_forward(qname).await;
+            } else {
+                // 本地解析
+            }
+        } else {
+            self.dns_config_manager.set_host(DnsHost::new(qname.to_string(), false));
+        }
+
         match self.get_or_create_fake_ip(qname).await {
             Some((a, b, c, d)) => {
                 let dns_answer = DnsRecord::A {
                     domain: qname.to_string(),
                     addr: Ipv4Addr::new(a, b, c, d),
-                    ttl: TransientTtl(60),
+                    ttl: TransientTtl(30),
                 };
 
                 let mut dns_packet = DnsPacket::new();

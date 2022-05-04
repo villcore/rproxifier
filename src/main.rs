@@ -1,466 +1,311 @@
-use std::io::{Read, Write};
+use std::future::Future;
+use std::iter::FromIterator;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::num::ParseIntError;
+use std::process::{Command, exit};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::mpsc::{channel, RecvTimeoutError, RecvError};
 use std::thread::sleep;
 use std::thread::spawn;
 use std::time::Duration;
-use std::process::{Command, exit};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
-use async_std_resolver::{resolver, config, AsyncStdResolver};
-use crate::dns::resolve::{ForwardingDnsResolver, DirectDnsResolver, UserConfigDnsResolver, DnsResolver, ConfigDnsResolver, FakeIpManager, resolve_host};
-use crate::dns::server::DnsUdpServer;
-use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpPacket, IpVersion, Ipv4Address};
 
-use log::{info, error, Level};
-use std::collections::{HashMap, LinkedList};
-#[cfg(target_os="macos")]
-use crate::sys::sys::{setup_ip_route, set_rlimit, DNSSetup};
-#[cfg(target_os="windows")]
-use crate::sys::sys::{DNSSetup};
-use smoltcp::Error;
-#[cfg(target_os="macos")]
-use tun::darwin::TunSocket;
-use tokio::net::{TcpStream, TcpListener};
-use std::sync::{Arc, RwLock, Mutex, PoisonError, MutexGuard};
-use std::str::FromStr;
+use async_std_resolver::{AsyncStdResolver, config, resolver};
+use async_std_resolver::config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts};
 use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncRead, AsyncWrite};
-use crate::dns::protocol::{QueryType, DnsPacket, DnsRecord, TransientTtl};
-use std::any::Any;
-use std::future::Future;
-use async_std_resolver::config::{NameServerConfigGroup, NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
-use tokio::sync::mpsc::{Sender, Receiver};
-use eframe::egui;
-use eframe::egui::{Context, CentralPanel, TopBottomPanel, Layout, Align, RichText, Color32};
-use eframe::epi::Frame;
-use eframe::epi::egui::Ui;
-use tokio::runtime::Runtime;
-use std::sync::mpsc::{channel, RecvTimeoutError};
-use dashmap::DashMap;
-use std::collections::hash_map::RandomState;
+use dashmap::{DashMap, Map};
 use dashmap::mapref::one::{Ref, RefMut};
+use log::{error, info, Level};
 use regex::Regex;
+use smoltcp::Error;
+use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, IpVersion, TcpPacket, UdpPacket};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc::{Receiver, Sender};
 use voluntary_servitude::vs;
-use std::iter::FromIterator;
-use std::num::ParseIntError;
+
+#[cfg(target_os = "macos")]
+use tun::darwin::TunSocket;
+
+use crate::core::dns_manager::{DnsManager, DnsConfigManager, DnsHost};
+use crate::core::nat_session::NatSessionManager;
+use crate::core::relay_server::TcpRelayServer;
+use crate::core::tun_server::TunServer;
+use crate::dns::protocol::{DnsPacket, DnsRecord, QueryType, TransientTtl};
+use crate::dns::resolve::{ConfigDnsResolver, DirectDnsResolver, DnsResolver, FakeIpManager, ForwardingDnsResolver, resolve_host, UserConfigDnsResolver};
+use crate::dns::server::DnsUdpServer;
+#[cfg(target_os = "macos")]
+use crate::sys::sys::{DNSSetup, set_rlimit, setup_ip_route};
+#[cfg(target_os = "windows")]
+use crate::sys::sys::DNSSetup;
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+use sled::IVec;
+use sysinfo::{SystemExt, ProcessExt, PidExt, Process, NetworkExt};
+use crate::core::host_route_manager::HostRouteManager;
+use crate::core::proxy_config_manager::{HostRouteStrategy, ProxyServerConfigManager, ProxyServerConfig, ProxyServerConfigType, RegexRouteRule, ProcessRegexRouteRule};
+use crate::core::active_connection_manager::ActiveConnectionManager;
+use netstat2::{ProtocolSocketInfo, SocketInfo};
+use crate::sys::sys::get_gateway;
 
 mod dns;
 mod sys;
 mod tun;
-mod gui;
+mod core;
+mod api;
 
 fn main() {
-    // setup log
     setup_log();
+    let db = Arc::new(core::db::Db::new("data/db"));
+    let mut network = Arc::new(NetworkModule::new("", 10000, db.clone()));
+    let app = Arc::new(App::new(network));
+    app.clear_dns();
+    app.start();
 
-    // run network module
-    let mut network = Arc::new(NetworkModule::new("", 10000));
-    // network.add_route_strategy("google.com".to_string(), HostRouteStrategy::Probe(false, false, "127.0.0.1".to_string(), 1081, None, 0));
-    // network.add_route_strategy("youtube.com".to_string(), HostRouteStrategy::Proxy("127.0.0.1".to_string(), 1081, None, 0));
-    network.add_route_strategy("github.com".to_string(), HostRouteStrategy::Proxy("192.168.50.58".to_string(), 10808, None, 0));
-    network.add_route_strategy("\\S+".to_string(), HostRouteStrategy::Probe(false, false, "192.168.50.58".to_string(), 10808, None, 0));
-    let background_network = network.clone();
-    spawn(move || background_network.run());
+    let app_cpy = app.clone();
+    rouille::start_server("0.0.0.0:18000", move |request| {
+        rouille::router!(request,
+            (POST) (/net/start_net) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let start_network: NetworkInterface = serde_json::from_reader(request_body).unwrap();
+                app_cpy.setup_dns_with_primary_ip(start_network);
+                rouille::Response::json(&true)
+            },
 
-    #[cfg(target_os="windows")]
-    {
-         network.setup_dns();
-         sleep(Duration::from_secs(10000));
-    }
+            (POST) (/net/stop_net) => {
+               let request_body: rouille::RequestBody = request.data().unwrap();
+                let start_network: NetworkInterface = serde_json::from_reader(request_body).unwrap();
+                app_cpy.clear_dns_with_primary_ip(start_network);
+                rouille::Response::json(&true)
+            },
 
-    // setup gui
-    let app = App::new(network.clone());
-    let options = eframe::NativeOptions {
-        transparent: true,
-        drag_and_drop_support: true,
-        ..Default::default()
-    };
-    eframe::run_native(Box::new(app), options);
+            (POST) (/route/add_global_rule) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let regex_route_rule: RegexRouteRule = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.host_route_manager.add_global_route_rule(regex_route_rule);
+                rouille::Response::json(&true)
+            },
+
+            (POST) (/route/remove_global_rule) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let remove_regex_route_rule: RegexRouteRule = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.host_route_manager.remove_global_route_rule(remove_regex_route_rule);
+                rouille::Response::json(&true)
+            },
+
+            (POST) (/route/set_global_rule) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let set_regex_route_rule_vec: Vec<RegexRouteRule> = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.host_route_manager.set_global_route_rule(set_regex_route_rule_vec);
+                rouille::Response::json(&true)
+            },
+
+            (GET) (/route/get_global_route) => {
+                let app = app_cpy.network_module.clone();
+                let global_route_rule_vec = app.host_route_manager.get_global_route_rule().unwrap_or_else(||vec![]);
+                rouille::Response::json(&global_route_rule_vec)
+            },
+
+            (POST) (/route/add_process_rule) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let regex_route_rule: ProcessRegexRouteRule = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.host_route_manager.add_process_route_rule(regex_route_rule);
+                rouille::Response::json(&true)
+            },
+
+            (GET) (/route/get_all_process_route) => {
+                let app = app_cpy.network_module.clone();
+                let global_route_rule_vec = app.host_route_manager.get_all_process_route_rule().unwrap_or_else(||vec![]);
+                rouille::Response::json(&global_route_rule_vec)
+            },
+
+            (POST) (/route/set_process_rule) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let regex_route_rule: Vec<ProcessRegexRouteRule> = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.host_route_manager.set_process_route_rule(regex_route_rule);
+                rouille::Response::json(&true)
+            },
+
+            (POST) (/route/remove_process_rule) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let remove_regex_route_rule: ProcessRegexRouteRule = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.host_route_manager.remove_process_route_rule(remove_regex_route_rule);
+                rouille::Response::json(&true)
+            },
+
+            (POST) (/dns/set_dns_config) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let dns_host: DnsHost = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.dns_config_manager.set_host(dns_host);
+                rouille::Response::json(&true)
+            },
+
+            (GET) (/proxy_server/proxy_server_list) => {
+                let app = app_cpy.network_module.clone();
+                if let Some(list) = app.proxy_server_config_manager.get_all_proxy_server_config() {
+                    let proxy_server_list = list.into_iter()
+                    .map(|config| api::ProxyServerConfigResponse::new(config))
+                    .collect::<Vec<api::ProxyServerConfigResponse>>();
+                    rouille::Response::json(&proxy_server_list)
+                } else {
+                    let empty_proxy_server_list: Vec<api::ProxyServerConfigResponse> = vec![];
+                    rouille::Response::json(&empty_proxy_server_list)
+                }
+            },
+
+            (POST) (/proxy_server/add_proxy_server) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let proxy_server_config: api::AddProxyServerConfigRequest = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.proxy_server_config_manager.set_proxy_server_config(ProxyServerConfig {
+                    name: proxy_server_config.name,
+                    config: ProxyServerConfigType::SocksV5(proxy_server_config.addr, proxy_server_config.port, "".to_string(), "".to_string()),
+                    available: true
+                });
+                rouille::Response::json(&true)
+            },
+
+            (POST) (/proxy_server/remove_proxy_server) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let proxy_server_config: api::RemoveProxyServerConfigRequest = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.proxy_server_config_manager.remove_proxy_server_config(proxy_server_config.name.as_str());
+                rouille::Response::json(&true)
+            },
+
+            (GET) (/connection/active_connection_list) => {
+                let app = app_cpy.network_module.clone();
+                let list = app.active_connection_manager.get_all_connection();
+                rouille::Response::json(&list)
+            },
+
+            (GET) (/system/process_list) => {
+                let app = app_cpy.network_module.clone();
+                // let list = app.process_manager.get_all_process();
+                rouille::Response::json(&true)
+            },
+
+            (GET) (/dns/get_dns_config_list) => {
+                let dns_query = request.get_param("dns_query").unwrap_or_else(||"".to_string());
+                let app = app_cpy.network_module.clone();
+                let local_dns_server = if app.dns_config_manager.get_local_dns_state() {
+                    "127.0.0.1"
+                } else {
+                    ""
+                };
+
+                let mut bind_network_interface = app.bind_network_interface.lock().unwrap();
+                let gateway = bind_network_interface.ip_addr.clone();
+                let all_dns_host: Vec<DnsHost> = app.dns_config_manager.get_all_host_contains(dns_query);
+                rouille::Response::json(&api::GetDnsConfigResponse::new(local_dns_server.to_string(), gateway, all_dns_host))
+            },
+
+            (POST) (/dns/set_dns_config) => {
+                let request_body: rouille::RequestBody = request.data().unwrap();
+                let dns_host: DnsHost = serde_json::from_reader(request_body).unwrap();
+                let app = app_cpy.network_module.clone();
+                app.dns_config_manager.set_host(dns_host);
+                rouille::Response::json(&true)
+            },
+
+            (GET) (/overview/network) => {
+                let app = app_cpy.network_module.clone();
+                let interfaces = app.clone().system_manager.get_network_interface().unwrap_or_else(||vec![]);
+                let network_state = app.clone().dns_config_manager.get_local_dns_state();
+                let bind_dns_interface = &app.clone().bind_network_interface.lock().unwrap().get_copy();
+                rouille::Response::json(&api::NetworkOverview{
+                    interface_list: interfaces,
+                    network_state: network_state,
+                    bind_interface: bind_dns_interface.get_copy()
+                })
+            },
+
+            (GET) (/process/get_all_process) => {
+                let process_query = request.get_param("process_query").unwrap_or_else(||"".to_string());
+                let app = app_cpy.network_module.clone();
+                let process_vec = app.system_manager.get_all_process(process_query);
+                rouille::Response::json(&process_vec)
+            },
+
+            _ => rouille::Response::empty_404()
+        )
+    });
 }
 
 fn setup_log() {
-    log4rs::init_file("config/logrs.yaml", Default::default()).unwrap();
-}
-
-pub struct NatSessionManager {
-    pub inner: Arc<Mutex<InnerNatSessionManager>>,
-}
-
-impl NatSessionManager {
-    pub fn new(begin_port: u16) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(
-                InnerNatSessionManager {
-                    session_addr_to_port: HashMap::new(),
-                    session_port_to_addr: HashMap::new(),
-                    port_activity_time: HashMap::new(),
-                    recycle_port_list: LinkedList::new(),
-                    next_port_seq: begin_port,
-                }
-            )),
-        }
-    }
-
-    pub fn get_session_port(&mut self, tuple: (Ipv4Addr, u16, Ipv4Addr, u16)) -> Option<u16> {
-        let mut inner = self.inner.lock().unwrap();
-        let port = match inner.session_addr_to_port.get(&tuple) {
-            None => {
-                let port = inner.next_port();
-                inner.session_addr_to_port.insert(tuple, port);
-                inner.session_port_to_addr.insert(port, tuple);
-                port
-            }
-
-            Some(port) => {
-                *port
-            }
-        };
-
-        inner.port_activity_time.insert(port, NatSessionManager::get_now_time());
-        Some(port)
-    }
-
-    pub fn get_now_time() -> u64 {
-        return std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    }
-
-    pub fn get_port_session_tuple(&mut self, port: u16) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16)> {
-        let mut inner = self.inner.lock().unwrap();
-        let session_tuple = match inner.session_port_to_addr.get(&port) {
-            None => {
-                None
-            }
-            Some((src_addr, src_port, dst_addr, dst_port)) => {
-                Some((src_addr.clone(), *src_port, dst_addr.clone(), *dst_port))
-            }
-        };
-
-        if let Some(_) = session_tuple {
-            inner.port_activity_time.insert(port, NatSessionManager::get_now_time());
-        }
-        session_tuple
-    }
-
-    /// 回收端口
-    pub fn recycle_port(&mut self) {
-        let mut inner = self.inner.lock().unwrap();
-        let now = NatSessionManager::get_now_time();
-        let invalid_port_list = inner.port_activity_time.iter()
-            .filter(|(k, v)| now - **v > 600).map(|(k, _)|*k).collect::<Vec<u16>>();
-
-        for port in invalid_port_list {
-            inner.recycle_port(port);
-            inner.port_activity_time.remove(&port);
-        }
-    }
-}
-
-pub struct InnerNatSessionManager {
-    pub session_addr_to_port: HashMap<(Ipv4Addr, u16, Ipv4Addr, u16), u16>,
-    pub session_port_to_addr: HashMap<u16, (Ipv4Addr, u16, Ipv4Addr, u16)>,
-    pub port_activity_time: HashMap<u16, u64>,
-    pub recycle_port_list: LinkedList<u16>,
-    pub next_port_seq: u16,
-}
-
-impl InnerNatSessionManager {
-    pub fn next_port(&mut self) -> u16 {
-        log::info!("current recycle port queue count {}", self.recycle_port_list.len());
-        return match self.get_recycle_port() {
-            None => {
-                let port = self.calculate_next_port();
-                log::info!("get new calculate next port {}", port);
-                port
-            }
-            Some(port) => {
-                log::info!("get available recycle port {}", port);
-                port
-            }
-        };
-    }
-
-    fn calculate_next_port(&mut self) -> u16 {
-        let next_port = self.next_port_seq;
-        self.next_port_seq = self.next_port_seq + 1;
-        next_port
-    }
-
-    fn get_recycle_port(&mut self) -> Option<u16> {
-        self.recycle_port_list.pop_front()
-    }
-
-    fn recycle_port(&mut self, port: u16) {
-        if let Some((src_addr, src_port, dst_addr, dst_port)) = self.session_port_to_addr.get(&port) {
-            self.session_addr_to_port.remove(&(*src_addr, *src_port, *dst_addr, *dst_port, ));
-            self.session_port_to_addr.remove(&port);
-            self.recycle_port_list.push_back(port);
-            log::info!("recycle port {}, total recycle port count {}", port, self.recycle_port_list.len());
-        }
-    }
+    log4rs::init_file("./config/logrs.yaml", Default::default()).unwrap();
 }
 
 /// App
 pub struct App {
-    network_module: Arc<NetworkModule>,
-
-    // gui
-    function_menu_list: Vec<(String, String)>,
-    selected_menu: String,
-    network_stared: bool,
-
-    // proxy server module
-    // proxy module
-    add_proxy_server_config_show: bool,
-    add_proxy_server_config_name: String,
-    add_proxy_server_config_addr: String,
-    add_proxy_server_config_port: String,
+    pub network_module: Arc<NetworkModule>,
 }
 
 impl App {
     pub fn new(network_module: Arc<NetworkModule>) -> Self {
         Self {
             network_module,
-            function_menu_list: vec![
-                ("Overview".to_string(), "🔧 Overview".to_string()),
-                ("Process".to_string(), "🔧 Process".to_string()),
-                ("Connection".to_string(), "🔧 Connection".to_string()),
-                ("DnsConfig".to_string(), "🔧 Dns Config".to_string()),
-                ("Proxy".to_string(), "🔧 Proxy".to_string()),
-                ("Rule".to_string(), "🔧 Rule".to_string())
-            ],
-            selected_menu: "Overview".to_string(),
-            network_stared: false,
-            add_proxy_server_config_show: false,
-            add_proxy_server_config_name: "".to_string(),
-            add_proxy_server_config_addr: "".to_string(),
-            add_proxy_server_config_port: "".to_string()
         }
     }
 
-    fn main_function_menu_ui(&mut self, ui: &mut Ui) {
+    pub fn start(&self) {
+        // run network module
+        let mut network = self.network_module.clone();
+        let background_network = network.clone();
+        spawn(move || background_network.run());
+        // network.setup_dns();
+    }
 
-        // menu label
-        ui.vertical_centered(|ui| {
-            ui.add_space(10.0);
-            ui.heading("💻 Menu");
-        });
-        ui.separator();
+    pub fn setup_dns(&self) {
+        log::info!("set up dns");
+        self.network_module.setup_dns();
+    }
 
-        // menu list
-        for (menu_item, menu_title) in self.function_menu_list.iter() {
-            if ui.selectable_label(menu_item.to_string() == self.selected_menu, RichText::new(menu_title).strong()).clicked() {
-                self.selected_menu = menu_item.to_string();
-            }
-            ui.separator();
+    pub fn setup_dns_with_primary_ip(&self, network_interface: NetworkInterface) {
+        let mut bind_network_interface = self.network_module.bind_network_interface.lock().unwrap();
+        bind_network_interface.ip_addr = network_interface.ip_addr.clone();
+        bind_network_interface.interface_name = network_interface.interface_name.clone();
+        log::info!("setup dns with interface {:?}", network_interface.get_copy());
+
+        let primary_ip = network_interface.interface_name;
+        if primary_ip.is_empty() {
+            self.setup_dns()
+        } else {
+            log::info!("set up dns with primary ip {}", primary_ip);
+            self.network_module.setup_dns_with_interface_name(primary_ip);
         }
     }
-}
 
-impl eframe::epi::App for App {
-    fn update(&mut self, ctx: &Context, frame: &Frame) {
-        egui::SidePanel::left("left_menu").show(ctx, |ui| {
-            self.main_function_menu_ui(ui);
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Overview
-            if self.selected_menu == "Overview" {
-                ui.vertical_centered(|ui| {
-                    ui.heading("Overview");
-                    ui.separator();
-                    ui.add_space(10.0);
-                });
-
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(), |ui| {
-                        ui.add_space(30.0);
-                        if gui::toggle::toggle_ui_compact(ui, &mut self.network_stared).changed() {
-                            if self.network_stared {
-                                self.network_module.setup_dns()
-                            } else {
-                                self.network_module.clear_dns()
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        if self.network_stared {
-                            ui.label(RichText::new("network started").color(Color32::from_rgb(0x20, 0xaf, 0x24)).strong());
-                        } else {
-                            ui.label(RichText::new("network not started").color(Color32::RED).strong());
-                        }
-                    });
-                });
-            }
-
-            // process
-            else if self.selected_menu == "Process" {
-                ui.vertical_centered(|ui| {
-                    ui.heading("Process");
-                    ui.separator();
-                });
-            }
-
-            // Connection
-
-            // DnsConfig
-
-            // Proxy
-            else if self.selected_menu == "Proxy" {
-                ui.vertical_centered(|ui| {
-                    ui.heading("Proxy");
-                    ui.separator();
-                });
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(), |ui| {
-                        ui.add_space(30.0);
-                        ui.button("Test Connection");
-                        ui.button("Remove Server");
-
-                        // add server
-                        if ui.button("Add Server").clicked() {
-                            log::info!("Add Server");
-                            if !self.add_proxy_server_config_show {
-                                self.add_proxy_server_config_show = true;
-                            }
-                        };
-
-                        if self.add_proxy_server_config_show {
-                            egui::Window::new("Add Server").resizable(true).open(&mut self.add_proxy_server_config_show).show(ctx, |ui| {
-                                egui::Grid::new("add-server-input").num_columns(2).show(ui, |ui| {
-                                    ui.label("name:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.add_proxy_server_config_name).hint_text("proxy server name"));
-                                    ui.end_row();
-
-                                    ui.label("addr:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.add_proxy_server_config_addr).hint_text("proxy server addr"));
-                                    ui.end_row();
-
-
-                                    ui.label("port:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.add_proxy_server_config_port).hint_text("proxy server addr"));
-                                    ui.end_row();
-
-                                    ui.horizontal(|ui|{
-                                        if ui.button(format!("{}     Ok","✅")).clicked() {
-                                            let proxy_config = {
-                                                let name = &self.add_proxy_server_config_name;
-                                                let addr = &self.add_proxy_server_config_addr;
-                                                let port = &self.add_proxy_server_config_port;
-                                                match u16::from_str(port) {
-                                                    Ok(port) => {
-                                                        Ok(ProxyServerConfig {
-                                                            name: name.to_string(),
-                                                            addr: addr.to_string(),
-                                                            port,
-                                                            available: false
-                                                        })
-                                                    }
-                                                    Err(errors) => Err(errors)
-                                                }
-                                            };
-                                            match proxy_config {
-                                                Ok(proxy_config) => {
-                                                    self.network_module.proxy_server_config_manager.add_config(proxy_config);
-                                                }
-                                                Err(errors) => {
-                                                    ui.label(format!("{}", errors));
-                                                }
-                                            }
-                                        };
-
-                                        if ui.button(format!("{} Cancel", "❌")).clicked() {
-                                            // reset config
-                                            // self.reset_proxy_server_config_windows();
-                                            // self.add_proxy_server_config_show = false;
-                                        };
-                                    });
-                                    ui.end_row();
-                                });
-                            });
-                        }
-                        ui.add_space(10.0);
-                    });
-                });
-
-                ui.add_space(10.0);
-                ui.separator();
-                // egui::ScrollArea::new([false, true]).show(ui, |ui|{
-                    let proxy_server_config_manager = self.network_module.clone().proxy_server_config_manager.clone();
-                    let config_list = proxy_server_config_manager.get_config_list();
-                    egui::Grid::new("sever_proxy_config_table")
-                        .striped(true)
-                        // .num_columns(3)
-                        .show(ui, |ui| {
-                            let name_label = ui.label("name");
-                            ui.label("addr");
-                            ui.label("port");
-                            ui.label("available");
-                            ui.end_row();
-
-                            for proxy_server_config in config_list {
-                                ui.label(proxy_server_config.name);
-                                ui.label(proxy_server_config.addr);
-                                ui.label(proxy_server_config.port.to_string());
-                                ui.label(if proxy_server_config.available {"available"} else {"unknown"});
-                                ui.end_row();
-                            }
-                        });
-                // });
-            }
-        });
+    pub fn clear_dns(&self) {
+        log::info!("clear dns");
+        self.network_module.clear_dns();
     }
 
-    fn on_exit(&mut self) {
-        if self.network_stared {
+    pub fn clear_dns_with_primary_ip(&self, network_interface: NetworkInterface) {
+        let mut bind_network_interface = self.network_module.bind_network_interface.lock().unwrap();
+        bind_network_interface.ip_addr = "".to_string();
+        bind_network_interface.interface_name = "".to_string();
+        let primary_ip = network_interface.interface_name.to_string();
+        if primary_ip.is_empty() {
             self.network_module.clear_dns();
+        } else {
+            log::info!("clear dns with primary ip {}", primary_ip);
+            self.network_module.clear_dns_with_interface_name(primary_ip);
         }
     }
 
-    fn name(&self) -> &str {
-        "rproxifier"
-    }
-}
-
-pub struct OverviewModule {
-    network_module: Arc<NetworkModule>
-}
-
-impl eframe::epi::App for OverviewModule {
-
-    fn update(&mut self, ctx: &Context, frame: &Frame) {
-
-    }
-
-    fn name(&self) -> &str {
-        "Overview"
-    }
-}
-
-pub struct ProxyModule {
-    // proxy module
-    add_proxy_server_config_show: bool,
-    add_proxy_server_config_name: String,
-    add_proxy_server_config_addr: String,
-    add_proxy_server_config_port: String,
-}
-
-impl Default for ProxyModule {
-    fn default() -> Self {
-        Self {
-            add_proxy_server_config_show: false,
-            add_proxy_server_config_name: "".to_string(),
-            add_proxy_server_config_addr: "".to_string(),
-            add_proxy_server_config_port: "".to_string()
+    pub fn clone(&self) -> App {
+        let b = self.network_module.clone();
+        App {
+            network_module: b
         }
-    }
-}
-
-impl ProxyModule {
-    fn reset_proxy_server_config_windows(&mut self) {
-        self.add_proxy_server_config_show = false;
-        self.add_proxy_server_config_name = "".to_string();
-        self.add_proxy_server_config_addr = "".to_string();
-        self.add_proxy_server_config_port = "".to_string();
     }
 }
 
@@ -472,23 +317,27 @@ pub struct NetworkModule {
     pub host_route_manager: Arc<HostRouteManager>,
     pub fake_ip_manager: Arc<FakeIpManager>,
     pub proxy_server_config_manager: Arc<ProxyServerConfigManager>,
+    pub active_connection_manager: Arc<ActiveConnectionManager>,
+    pub system_manager: Arc<SystemManager>,
+    pub dns_config_manager: Arc<DnsConfigManager>,
+    pub bind_network_interface: Arc<Mutex<NetworkInterface>>,
 }
 
 impl NetworkModule {
-    pub fn new(dns_listen: &str, net_session_begin_port: u16) -> Self {
+    pub fn new(dns_listen: &str, net_session_begin_port: u16, db: Arc<core::db::Db>) -> Self {
         Self {
             // TODO: windows
             dns_listen: dns_listen.to_string(),
             dns_setup: sys::sys::DNSSetup::new(dns_listen.to_string()),
             nat_session_manager: Arc::new(Mutex::new(NatSessionManager::new(net_session_begin_port))),
-            host_route_manager: Arc::new(Default::default()),
+            host_route_manager: Arc::new(HostRouteManager::new(db.clone())),
             fake_ip_manager: Arc::new(FakeIpManager::new((10, 0, 0, 100))),
-            proxy_server_config_manager: Arc::new(Default::default())
+            proxy_server_config_manager: Arc::new(ProxyServerConfigManager::new(db.clone())),
+            active_connection_manager: Arc::new(Default::default()),
+            system_manager: Arc::new(SystemManager { system: Default::default() }),
+            dns_config_manager: Arc::new(DnsConfigManager::new(db.clone())),
+            bind_network_interface: Arc::new(Mutex::new(NetworkInterface { interface_name: "".to_string(), ip_addr: "".to_string()}))
         }
-    }
-
-    pub fn add_route_strategy(&self, host: String, strategy: HostRouteStrategy) {
-        self.host_route_manager.add_route_strategy(host, strategy);
     }
 
     pub fn run_relay_server(&self) {
@@ -498,13 +347,26 @@ impl NetworkModule {
     pub fn setup_dns(&self) {
         log::info!("setup run dns server, listen at {}", self.dns_listen);
         self.dns_setup.set_dns();
+        self.dns_config_manager.mark_local_dns_start();
+    }
+
+    pub fn setup_dns_with_interface_name(&self, interface_name: String) {
+        log::info!("setup run dns server, listen at {}", self.dns_listen);
+        self.dns_setup.set_dns_with_primary_interface_name(interface_name);
+        self.dns_config_manager.mark_local_dns_start();
     }
 
     pub fn clear_dns(&self) {
         self.dns_setup.clear_dns();
+        self.dns_config_manager.mark_local_dns_stop();
     }
 
-    #[cfg(target_os="macos")]
+    pub fn clear_dns_with_interface_name(&self, interface_name: String) {
+        self.dns_setup.clear_dns_with_interface_name(interface_name);
+        self.dns_config_manager.mark_local_dns_stop();
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn set_rlimit(&self, limit: u64) {
         set_rlimit(limit);
     }
@@ -514,11 +376,15 @@ impl NetworkModule {
     }
 
     pub fn run(&self) {
-        #[cfg(target_os="macos")]
+        #[cfg(target_os = "macos")]
         self.set_rlimit(30000);
         let nat_session_manager = self.nat_session_manager.clone();
         let fake_ip_manager = self.fake_ip_manager.clone();
         let host_route_manager = self.host_route_manager.clone();
+        let proxy_server_config_manager = self.proxy_server_config_manager.clone();
+        let active_connection_manager = self.active_connection_manager.clone();
+        let process_manager = self.system_manager.clone();
+        let dns_config_manager = self.dns_config_manager.clone();
 
         // start tun_server
         let (stared_event_sender, mut stared_event_receiver) = std::sync::mpsc::channel();
@@ -534,7 +400,13 @@ impl NetworkModule {
         }
 
         // start dns_server & tcp_relay_server
-        self.run_async_component(nat_session_manager.clone(), fake_ip_manager.clone(), host_route_manager.clone());
+        self.run_async_component(nat_session_manager.clone(),
+                                 fake_ip_manager.clone(),
+                                 host_route_manager.clone(),
+                                 proxy_server_config_manager.clone(),
+                                 active_connection_manager.clone(),
+                                 process_manager.clone(),
+                                 dns_config_manager.clone());
     }
 
     pub fn run_sync_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>, stared_event_sender: std::sync::mpsc::Sender<bool>) {
@@ -544,33 +416,49 @@ impl NetworkModule {
             tun_ip: "10.0.0.1".to_string(),
             tun_cidr: "10.0.0.0/16".to_string(),
             tun_name: "utun9".to_string(),
-            relay_addr:  Ipv4Addr::from_str("10.0.0.1").unwrap(),
+            relay_addr: Ipv4Addr::from_str("10.0.0.1").unwrap(),
             relay_port: 1300,
-            nat_session_manager
+            nat_session_manager,
         };
         spawn(move || tun_server.run_tun_server(stared_event_sender));
     }
 
-    pub fn run_async_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>, fake_ip_manager: Arc<FakeIpManager>, host_route_manager: Arc<HostRouteManager>) {
+    pub fn run_async_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>,
+                               fake_ip_manager: Arc<FakeIpManager>,
+                               host_route_manager: Arc<HostRouteManager>,
+                               proxy_server_config_manager: Arc<ProxyServerConfigManager>,
+                               active_connection_manager: Arc<ActiveConnectionManager>,
+                               process_manager: Arc<SystemManager>,
+                               dns_config_manager: Arc<DnsConfigManager>) {
+
         log::info!("run async component");
         let run_time = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(run_time) => {
                 run_time
-            },
+            }
             Err(errors) => {
                 log::error!("create runtime error, {}", errors);
-                return
+                return;
             }
         };
         run_time.block_on(async {
-            // dns_server
+            // dns resolver
             let resolver_config = self.default_resolver_config();
             let resolver_opts = self.default_resolver_opts();
-            let resolver = resolver(resolver_config, resolver_opts).await.expect("failed to connect resolver");
+            let resolver = async_std_resolver::resolver(resolver_config, resolver_opts).await.expect("failed to connect resolver");
+
+            // forward dns resolver
+            let forward_resolver_config = self.forward_resolver_config();
+            let forward_resolver_opts = self.default_resolver_opts();
+            let forward_resolver = async_std_resolver::resolver(forward_resolver_config, forward_resolver_opts).await.expect("failed to connect resolver");
+
+            // dns server
             let dns_server = DnsManager {
                 resolver: Arc::new(resolver.clone()),
+                forward_resolver: Arc::new(forward_resolver.clone()),
                 fake_ip_manager: fake_ip_manager.clone(),
-                dns_listen: "127.0.0.1:53".to_string()
+                dns_config_manager: dns_config_manager.clone(),
+                dns_listen: "127.0.0.1:53".to_string(),
             };
             log::info!("start run dns sever");
             dns_server.run_dns_server();
@@ -582,8 +470,12 @@ impl NetworkModule {
                 fake_ip_manager: fake_ip_manager.clone(),
                 nat_session_manager: nat_session_manager.clone(),
                 host_route_manager: host_route_manager.clone(),
+                active_connection_manager: active_connection_manager.clone(),
+                proxy_server_config_manager: proxy_server_config_manager.clone(),
                 listen_addr: (127, 0, 0, 1),
-                listen_port: 1300
+                listen_port: 1300,
+                process_manager: process_manager.clone(),
+                dns_config_manager: dns_config_manager.clone()
             };
             log::info!("start tcp relay sever");
             tcp_relay_server.run().await;
@@ -600,7 +492,7 @@ impl NetworkModule {
                 protocol: Protocol::Udp,
                 tls_dns_name: None,
                 trust_nx_responses: false,
-                bind_addr: None
+                bind_addr: None,
             }
         );
 
@@ -610,7 +502,7 @@ impl NetworkModule {
                 protocol: Protocol::Udp,
                 tls_dns_name: None,
                 trust_nx_responses: false,
-                bind_addr: None
+                bind_addr: None,
             }
         );
 
@@ -620,7 +512,28 @@ impl NetworkModule {
                 protocol: Protocol::Tcp,
                 tls_dns_name: None,
                 trust_nx_responses: false,
-                bind_addr: None
+                bind_addr: None,
+            }
+        );
+        return config::ResolverConfig::from_parts(None, Vec::new(), name_server_config_group);
+    }
+
+    fn forward_resolver_config(&self) -> ResolverConfig {
+
+        #[cfg(target_os="macos")]
+        let gateway_addr = get_gateway();
+
+        #[cfg(target_os="windows")]
+        let gateway_addr = "192.168.0.1".to_string();
+        let num_concurrent_reqs = 3;
+        let mut name_server_config_group = NameServerConfigGroup::with_capacity(num_concurrent_reqs);
+        name_server_config_group.push(
+            NameServerConfig {
+                socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str(gateway_addr.as_str()).unwrap(), 53)),
+                protocol: Protocol::Udp,
+                tls_dns_name: None,
+                trust_nx_responses: false,
+                bind_addr: None,
             }
         );
         return config::ResolverConfig::from_parts(None, Vec::new(), name_server_config_group);
@@ -643,850 +556,153 @@ pub struct AppConfig {
     pub relay_port: u16,
 }
 
-///
-pub struct TunServer {
-    pub tun_ip: String,
-    pub tun_cidr: String,
-    pub tun_name: String,
-    pub relay_addr: Ipv4Addr,
-    pub relay_port: u16,
-    pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub process_name: String,
+    pub process_execute_path: String,
 }
 
-impl TunServer {
-    pub fn new(tun_ip: String, tun_cidr: String, tun_name: String, relay_port: u16,
-               nat_session_manager: Arc<Mutex<NatSessionManager>>) -> Self {
-        let relay_addr = Ipv4Addr::from_str(&tun_ip).unwrap();
-        TunServer {
-            tun_ip,
-            tun_cidr,
-            tun_name,
-            relay_addr,
-            relay_port,
-            nat_session_manager,
+impl ProcessInfo {
+    pub fn get_copy(&self) -> ProcessInfo {
+        ProcessInfo {
+            pid: self.pid,
+            process_name: self.process_name.to_string(),
+            process_execute_path: self.process_execute_path.to_string()
+        }
+    }
+}
+
+pub struct SystemManager {
+    pub system: sysinfo::System,
+}
+
+impl SystemManager {
+
+    pub fn new() -> Self {
+        Self {
+            system: Default::default()
         }
     }
 
-    pub fn run_tun_server(mut self, stared_event_sender: std::sync::mpsc::Sender<bool>) {
-        spawn(move || self.run_tun_server_inner(stared_event_sender));
-    }
-
-    pub fn run_tun_server_inner(&mut self, stared_event_sender: std::sync::mpsc::Sender<bool>) {
-
-        #[cfg(target_os="macos")]
-        let mut tun_socket = match tun::darwin::TunSocket::new(&self.tun_name) {
-            Ok(tun_socket) => tun_socket,
-            Err(error) => {
-                log::error!("create darwin tun error, {}", error.to_string());
-                return;
-            }
-        };
-        #[cfg(target_os="macos")]
-        setup_ip_route(&self.tun_name, &self.tun_ip, &self.tun_cidr);
-
-        #[cfg(target_os="windows")]
-        let mut tun_socket = match tun::windows::TunSocket::new("rproxifier-tun") {
-            Ok(tun_socket) => tun_socket,
-            Err(error) => {
-                log::error!("create windows tun error, {}", error.to_string());
-                return;
-            }
-        };
-
-        // windows sleep for a while
-        #[cfg(target_os="windows")]
-        sleep(Duration::from_secs(5));
-
-        stared_event_sender.send(true);
-        let relay_addr = self.relay_addr;
-        let relay_port = self.relay_port;
-        self.run_ip_packet_transfer(tun_socket, relay_addr, relay_port);
-    }
-
-    fn run_ip_packet_transfer<T>(&mut self, mut tun_socket: T, relay_addr: Ipv4Addr, relay_port: u16) where T: Read + Write {
-        loop {
-            match self.transfer_ip_packet(&mut tun_socket, relay_addr, relay_port) {
-                Err(errors) => {
-                    log::error!("transfer tcp packet error, {}", errors);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn transfer_ip_packet<T>(&mut self, mut tun_socket: T,
-                          relay_addr: Ipv4Addr, relay_port: u16) -> anyhow::Result<()>
-        where T: Read + Write {
-
-        let nat_session_manager = self.nat_session_manager.clone();
-        let mut socket_buf = [0u8; u16::MAX as usize];
-        let mut ipv4_packet = match self.read_ipv4_packet(&mut tun_socket, &mut socket_buf) {
-            Ok(packet) => packet,
-            Err(errors) => return Err(anyhow::anyhow!("tun not supported udp"))
-        };
-
-        match ipv4_packet.protocol() {
-            IpProtocol::Tcp => {
-                if let Err(errors) = self.transfer_tcp_packet(&mut tun_socket, relay_addr, relay_port, nat_session_manager, ipv4_packet) {
-                    return Err(errors);
-                }
-            }
-
-            IpProtocol::Udp => {
-                return Err(anyhow::anyhow!("tun not supported udp"));
-            }
-
-            other => {
-                return Err(anyhow::anyhow!(format!("unsupported ipv4 protocol {} ", other)));
-            }
-        }
-        Ok(())
-    }
-
-    fn transfer_tcp_packet<T>(&self, tun_socket: &mut T,
-                           relay_addr: Ipv4Addr, relay_port: u16,
-                           nat_session_manager: Arc<Mutex<NatSessionManager>>,
-                           mut ipv4_packet: Ipv4Packet<&mut [u8]>) -> anyhow::Result<()>
-        where T: Read + Write {
-        let (src_addr, dst_addr) = {
-            (ipv4_packet.src_addr(), ipv4_packet.dst_addr())
-        };
-
-        let mut tcp_packet = match TcpPacket::new_checked(ipv4_packet.payload_mut()) {
-            Ok(packet) => packet,
-            Err(error) => return Err(anyhow::anyhow!(format!("create checked tcp packet error, {}", error)))
-        };
-
-        let src_port = tcp_packet.src_port();
-        let dst_port = tcp_packet.dst_port();
-        let src_addr = Ipv4Addr::from(src_addr);
-        let dst_addr = Ipv4Addr::from(dst_addr);
-
-        let mut nat_session_manager = match nat_session_manager.lock() {
-            Ok(nat_session_manager) => {
-                nat_session_manager
-            }
-
-            Err(errors) => {
-                return Err(anyhow::anyhow!(format!(", {}", errors)));
-            }
-        };
-
-        let new_ip_packet = {
-            if src_addr == relay_addr && src_port == relay_port {
-                if let Some((src_addr, src_port, dst_addr, dst_port)) = nat_session_manager.get_port_session_tuple(dst_port) {
-                    tcp_packet.set_src_port(dst_port);
-                    tcp_packet.set_dst_port(src_port);
-                    tcp_packet.fill_checksum(&dst_addr.into(), &src_addr.into());
-                    ipv4_packet.set_src_addr(dst_addr.into());
-                    ipv4_packet.set_dst_addr(src_addr.into());
-                    ipv4_packet.fill_checksum();
-                    ipv4_packet
-                } else {
-                    return Err(anyhow::anyhow!(format!("get invalid nat session with port, {}", dst_port)));
-                }
-            } else {
-                let port = match nat_session_manager.get_session_port((src_addr, src_port, dst_addr, dst_port)) {
-                    None => return Err(anyhow::anyhow!(format!("get session port with tuple {}:{} -> {}:{} error", src_addr, src_port, dst_addr, dst_port))),
-                    Some(port) => port
+    pub fn get_process(&self, pid_num: u32) -> Option<ProcessInfo> {
+        // TODO: FIXME
+        let pid = sysinfo::Pid::from_u32(pid_num);
+        let mut system = sysinfo::System::new();
+        system.refresh_process(pid);
+        return match system.process(pid) {
+            None => None,
+            Some(process) => {
+                #[cfg(target_os="macos")]
+                let cmd = {
+                    if process.cmd().len() > 0 {
+                        process.cmd()[0].to_string()
+                    } else {
+                        "".to_string()
+                    }
                 };
 
-                tcp_packet.set_src_port(port);
-                tcp_packet.set_dst_port(relay_port);
-                tcp_packet.fill_checksum(&dst_addr.into(), &relay_addr.into());
-                ipv4_packet.set_src_addr(dst_addr.into());
-                ipv4_packet.set_dst_addr(relay_addr.into());
-                ipv4_packet.fill_checksum();
-                ipv4_packet
-            }
-        };
-        let packet_bytes = new_ip_packet.as_ref();
-        tun_socket.write(packet_bytes);
-        Ok(())
-    }
-
-    fn read_ipv4_packet<'a, T>(&self, mut tun_socket: T, byte_mut: &'a mut [u8]) -> anyhow::Result<Ipv4Packet<&'a mut [u8]>> where T: Read + Write  {
-        let read_size = match tun_socket.read(byte_mut) {
-            Ok(size) => { size }
-            Err(error) => {
-                return Err(anyhow::anyhow!(format!("tun socket read error, {}", error)));
-            }
-        };
-
-        let ip_version = match IpVersion::of_packet(byte_mut) {
-            Ok(ip_version) => {
-                ip_version
-            }
-            Err(error) => {
-                return Err(anyhow::anyhow!(format!("check ip packet version error, {}", error)));
-            }
-        };
-
-        if ip_version == IpVersion::Ipv6 {
-            return Err(anyhow::anyhow!(format!("tun not supported ipv6 packet")));
-        }
-
-        match Ipv4Packet::new_checked(byte_mut) {
-            Ok(p) => Ok(p),
-            Err(errors) => {
-                return Err(anyhow::anyhow!(format!("tun read ip_v4 packet error, {}", errors)));
-            }
-        }
-    }
-}
-
-///
-pub struct TcpRelayServer {
-    pub resolver: Arc<AsyncStdResolver>,
-    pub fake_ip_manager: Arc<FakeIpManager>,
-    pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
-    pub host_route_manager: Arc<HostRouteManager>,
-    pub listen_addr: (u8, u8, u8, u8),
-    pub listen_port: u16,
-}
-
-impl TcpRelayServer {
-
-    pub async fn run(&self) {
-        self.run_session_port_recycler();
-
-        // bind address
-        self.run_tcp_server().await;
-    }
-
-    fn run_session_port_recycler(&self) {
-        let recycler_session_manager = self.nat_session_manager.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                log::info!("start recycle invalid session port at time {}",  NatSessionManager::get_now_time());
-                let mut session_manager = recycler_session_manager.lock().unwrap();
-                session_manager.recycle_port();
-                log::info!("recycle invalid session port complete at time {}",  NatSessionManager::get_now_time());
-            }
-        });
-    }
-
-    async fn run_tcp_server(&self) {
-        // TODO: modify
-        let listen_addr = (Ipv4Addr::new(10, 0, 0, 1), 1300);
-        let tcp_listener = match TcpListener::bind(listen_addr).await {
-            Ok(_tcp_listener) => {
-                _tcp_listener
-            }
-            Err(err) => {
-                log::error!("bind tun tcp server error {}", err.to_string());
-                return;
-            }
-        };
-
-        log::info!("tun tcp relay server listen on {}:{}", listen_addr.0, listen_addr.1);
-        while let Ok((mut tcp_socket, socket_addr)) = tcp_listener.accept().await {
-            self.accept_socket(tcp_socket, socket_addr).await;
-        }
-    }
-
-    async fn accept_socket(&self, mut tcp_socket: TcpStream, socket_addr: SocketAddr) {
-        log::info!("tun tcp relay server accept relay src socket {} ", socket_addr.to_string());
-        let mut nat_session_manager = match self.nat_session_manager.lock() {
-            Ok(nat_session_manager) => nat_session_manager,
-            Err(errors) => {
-                log::error!("get nat session manager error, {}", errors);
-                return
-            }
-        };
-
-        let session_port = socket_addr.port();
-        match nat_session_manager.get_port_session_tuple(session_port) {
-            None => {
-                log::warn!("invalid session port {}", session_port);
-            }
-            Some((src_addr, src_port, dst_addr, dst_port)) => {
-                log::info!("real address is {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
-                let resolver_copy = self.resolver.clone();
-                let fake_ip_manager = self.fake_ip_manager.clone();
-                let host_route_manager = self.host_route_manager.clone();
-                tokio::spawn(async move {
-                    let dst_addr_bytes = dst_addr.octets();
-                    let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
-                    let origin_host_port = match fake_ip_manager.get_host(&fake_ip) {
-                        None => {
-                            log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                            return
-                        }
-
-                        Some(host) => (host, dst_port)
-                    };
-
-                    let rule_strategy = match host_route_manager.get_route_strategy(&origin_host_port.0) {
-                        None => HostRouteStrategy::Direct,
-                        Some(strategy) => strategy
-                    };
-
-                    match rule_strategy {
-                        HostRouteStrategy::Direct => {
-                            let direct_address_port = TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy, fake_ip_manager).await;
-                            let (host, port) = match direct_address_port {
-                                None => {
-                                    log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                                    return
-                                }
-                                Some((real_host, real_port)) => (real_host.to_string(), real_port)
-                            };
-
-                            let mut dst_socket = match TcpStream::connect((host.as_str(), port)).await {
-                                Ok(dst_socket) => {
-                                    log::info!("session {} => connect real_addr {}:{}", session_port, &host, port);
-                                    dst_socket
-                                }
-                                Err(errors) => {
-                                    log::error!("session {} => connect real addr {}:{} error, {}", session_port, &host, port, errors);
-                                    return;
-                                }
-                            };
-                            let mut stream_pipe = StreamPipe::new(4096, tcp_socket, dst_socket);
-                            stream_pipe.pipe_loop().await
-                        }
-
-                        HostRouteStrategy::Proxy(addr, port, direct_ip, last_update_time) => {
-                            // host_route_manager
-                            // TODO: dns_lookup cache.
-                            let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &addr, port).await {
-                                None => {
-                                    return
-                                },
-                                Some((ip, port)) => (ip, port)
-                            };
-
-                            let target_addr = format!("{}:{}", origin_host_port.0, origin_host_port.1);
-                            let mut proxy_socket = tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await.unwrap();
-                            let mut stream_pipe = StreamPipe::new(4096, tcp_socket, proxy_socket);
-                            stream_pipe.pipe_loop().await
-                        }
-
-                        HostRouteStrategy::Probe(tested, need_proxy, addr, port, direct_ip, last_update_time) => {
-                            let mut need_proxy = need_proxy;
-                            let (dst_socket, direct_connected) = if !tested {
-                                let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy.clone(), fake_ip_manager).await {
-                                    None => None,
-                                    Some(direct_ip_port) => Some(direct_ip_port)
-                                };
-
-                                let test_dst_socket = match direct_address_port {
-                                    None => (None, false),
-                                    Some(direct_address_port) => {
-                                        log::info!("connect to {}:{}", direct_address_port.0, direct_address_port.1);
-                                        match TcpRelayServer::connect_with_timeout(direct_address_port,Duration::from_secs(3)).await {
-                                            Ok(mut dst_socket) => (Some(dst_socket), true),
-                                            Err(errors) => {
-                                                log::info!("try connect to timeout");
-                                                (None, false)
-                                            },
-                                        }
-                                    }
-                                };
-                                host_route_manager.mark_probe_direct(&origin_host_port.0, !test_dst_socket.1);
-                                test_dst_socket
-                            } else {
-                                if !need_proxy {
-                                    let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy.clone(), fake_ip_manager).await {
-                                        None => return,
-                                        Some(direct_ip_port) => Some(direct_ip_port)
-                                    };
-
-                                    match direct_address_port {
-                                        None => return,
-                                        Some(direct_address_port) => {
-                                            log::info!("connect to {}:{}", direct_address_port.0, direct_address_port.1);
-                                            match TcpStream::connect(direct_address_port).await {
-                                                Ok(mut dst_socket) => (Some(dst_socket), true),
-                                                Err(errors) => return,
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    (None, !need_proxy)
-                                }
-                            };
-
-                            if direct_connected {
-                                // direct
-                                let mut stream_pipe = StreamPipe::new(4096, tcp_socket, dst_socket.unwrap());
-                                stream_pipe.pipe_loop().await
-                            } else {
-                                // proxy
-                                let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &addr, port).await {
-                                    None => {
-                                        return
-                                    },
-                                    Some((ip, port)) => (ip, port)
-                                };
-
-                                let target_addr = format!("{}:{}", origin_host_port.0, origin_host_port.1);
-                                let mut proxy_socket = tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await.unwrap();
-                                let mut stream_pipe = StreamPipe::new(4096, tcp_socket, proxy_socket);
-                                stream_pipe.pipe_loop().await
-                            }
-                        }
-
-                        HostRouteStrategy::Reject => {
-                            log::info!("reject connection to {}:{}",origin_host_port.0, origin_host_port.1)
-                        }
-                    }
-                });
+                #[cfg(target_os="windows")]
+                let cmd = process.exe().to_str().unwrap_or_else(||"").to_string();
+                Some(ProcessInfo {
+                    pid: pid_num,
+                    process_name: cmd.to_string(),
+                    process_execute_path: cmd
+                })
             }
         }
     }
 
-    pub async fn connect_with_timeout<A: tokio::net::ToSocketAddrs>(addr: A, timeout_sec: Duration) -> anyhow::Result<TcpStream> {
-        let timeout_sec = Duration::from_secs(5);
-        let connected_socket = tokio::select! {
-            connected_socket = TcpStream::connect(addr) => {
-                match connected_socket {
-                    Ok(socket) => {
-                        anyhow::Ok(socket)
-                    }
-                    Err(errors) => {
-                        Err(anyhow::anyhow!(format!("connect error, {}", errors)))
+    pub fn get_process_by_port(&self, port: u16) -> Option<SocketInfo> {
+        let af_flags = netstat2::AddressFamilyFlags::IPV4;
+        let proto_flags = netstat2::ProtocolFlags::TCP | netstat2::ProtocolFlags::UDP;
+        return match netstat2::get_sockets_info(af_flags, proto_flags) {
+            Ok(vec) => {
+                for socket_info in vec {
+                    if socket_info.local_port() == port {
+                        return Some(socket_info)
                     }
                 }
-            }
-
-            _ = tokio::time::sleep(timeout_sec) => {
-                    Err(anyhow::anyhow!(format!("connect timeout")))
-            }
-        };
-        return connected_socket;
-    }
-
-    async fn resolve_direct_ip_port(dst_addr: Ipv4Addr, dst_port: u16,
-                                    resolver: Arc<AsyncStdResolver>,
-                                    fake_ip_manager: Arc<FakeIpManager>) -> Option<(String, u16)> {
-
-        let dst_addr_bytes = dst_addr.octets();
-        let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
-        let direct_address_port = match fake_ip_manager.get_host(&fake_ip) {
-            None => {
-                log::error!("get host from fake_ip {} error", dst_addr.to_string());
                 None
             }
-
-            Some(host) => {
-                log::info!("get host from fake_ip {} success, host {}", dst_addr.to_string(), host);
-                TcpRelayServer::resolve_host_ip(resolver, &host, dst_port).await
-            }
-        };
-        direct_address_port
-    }
-
-    async fn resolve_host_ip(resolver: Arc<AsyncStdResolver>, host: &str, port: u16) -> Option<((String, u16))> {
-        let mut host_splits: Vec<&str> = host.split(".").collect();
-        let host_num_splits: Vec<u8> = host_splits.iter()
-            .map(|s| s.parse::<u8>())
-            .filter(|r| r.is_ok())
-            .map(|r| r.unwrap())
-            .collect();
-
-        let host_split_len = host_splits.len();
-        if host_split_len == 4 && host_num_splits.len() == host_split_len {
-            // 如果是点号ip地址格式，选择直接连接
-            Some((host.to_string(), port))
-        } else {
-            // 如果是字符串host格式，需要dns解析
-            match resolve_host(resolver, &host).await {
-                Ok(ipv4_addr) => {
-                    Some((ipv4_addr.to_string(), port))
-                }
-                Err(_) => {
-                    log::error!("resolve host {} error", host);
-                    None
-                }
+            Err(errors) => {
+                None
             }
         }
     }
-}
 
-///
-pub struct DnsManager {
-    pub resolver: Arc<AsyncStdResolver>,
-    pub fake_ip_manager: Arc<FakeIpManager>,
-    pub dns_listen: String,
-}
-
-impl DnsManager {
-
-    pub fn run_dns_server(self) {
-        let fake_ip_manager = self.fake_ip_manager.clone();
-        let async_resolver = (*self.resolver).clone();
-        let config_dns_resolver = ConfigDnsResolver::new(fake_ip_manager, async_resolver);
-        tokio::spawn(self.start_config_dns_server(config_dns_resolver));
-    }
-
-    async fn start_config_dns_server(self, config_dns_resolver: ConfigDnsResolver) {
-        log::info!("start dns server at {}", self.dns_listen);
-        let dns_server: DnsUdpServer = dns::server::DnsUdpServer::new(
-            self.dns_listen,
-            Box::new(config_dns_resolver),
-        ).await;
-        dns_server.run_server().await;
-    }
-}
-
-///
-pub struct HostRouteManager {
-    host_regex_route_strategy: voluntary_servitude::VS<(String, regex::Regex, HostRouteStrategy)>,
-    host_route_strategy: DashMap<String, HostRouteStrategy>,
-}
-
-impl Default for HostRouteManager {
-    fn default() -> Self {
-        HostRouteManager::new(vec![])
-    }
-}
-
-impl HostRouteManager {
-
-    pub fn new(host_regex_route_strategy: Vec<(String, HostRouteStrategy)>) -> Self {
-        let regex_route_list: Vec<(String, regex::Regex, HostRouteStrategy)> = host_regex_route_strategy.into_iter()
-            .map(|(host, strategy)| {
-                match regex::Regex::new(&host) {
-                    Ok(regex) => Some((host, regex, strategy)),
-                    Err(errors) => {
-                        log::error!("create regex {} error, {}", host, errors);
-                        None
+    pub fn get_network_interface(&self) -> Option<Vec<NetworkInterface>> {
+        match local_ip_address::list_afinet_netifas() {
+            Ok(vec) => {
+                let mut interface_vec = vec![];
+                for (interface, ip) in vec {
+                    #[cfg(target_os = "macos")]
+                    if matches!(ip, IpAddr::V4(_)) && interface != "lo0"{
+                        interface_vec.push(NetworkInterface{
+                            interface_name: interface,
+                            ip_addr: ip.to_string()
+                        })
                     }
+
+                    #[cfg(target_os = "windows")]
+                    if matches!(ip, IpAddr::V4(_)) && interface != "rproxifier-tun" && !interface.contains("Loopback") {
+                        interface_vec.push(NetworkInterface{
+                            interface_name: interface,
+                            ip_addr: ip.to_string()
+                        });
+                    }
+                }
+                return Some(interface_vec)
+            }
+            Err(errors) => {
+                log::error!("get network interface error")
+            }
+        }
+        None
+    }
+
+    pub fn get_all_process(&self, match_str: String) -> Vec<ProcessInfo> {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes();
+
+        system.processes().into_iter()
+            .map(|(pid, process)|{
+                let process_name = process.name().to_string();
+                let cmd = {
+                    if process.cmd().len() > 0 {
+                        process.cmd()[0].to_string()
+                    } else {
+                        "".to_string()
+                    }
+                };
+
+                if process_name.contains(&match_str) || cmd.contains(&match_str) {
+                    Some(ProcessInfo {
+                        pid: pid.as_u32(),
+                        process_name: process.name().to_string(),
+                        process_execute_path: cmd
+                    })
+                } else {
+                    None
                 }
             })
-            .filter(|result| result.is_some())
-            .map(|result| result.unwrap())
-            .collect();
-        Self {
-            host_regex_route_strategy: voluntary_servitude::VS::from_iter(regex_route_list),
-            host_route_strategy: Default::default(),
-        }
-    }
-
-    pub fn add_route_strategy(&self, host: String, strategy: HostRouteStrategy) {
-        if let Ok(regex) = regex::Regex::new(&host) {
-            self.host_regex_route_strategy.append((host, regex, strategy));
-        }
-    }
-
-    pub fn get_route_strategy(&self, host: &str) -> Option<(HostRouteStrategy)> {
-        match self.host_route_strategy.get(host) {
-            Some(kv_ref) => return {
-                Some(kv_ref.value().get_copy())
-            },
-            None => {}
-        }
-
-        let mut iter = self.host_regex_route_strategy.iter();
-        for (_, regex_matcher, strategy) in &mut iter {
-            if let Some(_) = regex_matcher.captures(host) {
-                let route_strategy = strategy.get_copy();
-                self.host_route_strategy.insert(host.to_string(), route_strategy);
-                break
-            }
-        }
-
-        return match self.host_route_strategy.get(host) {
-            Some(kv_ref) => {
-                Some(kv_ref.value().get_copy())
-            },
-            None => Some(HostRouteStrategy::Direct)
-        }
-    }
-
-    pub fn mark_probe_direct(&self, host: &str, need_proxy: bool) {
-        let strategy = match self.host_route_strategy.get_mut(host) {
-            None => None,
-            Some(kv_ref) => {
-                match kv_ref.value() {
-                    HostRouteStrategy::Probe(_, _, ip_addr, port, direct_ip_addr, last_update_time) => {
-                        Some(HostRouteStrategy::Probe(true, need_proxy, ip_addr.to_string(), *port, *direct_ip_addr, *last_update_time))
-                    }
-                    _ => None
-                }
-            }
-        };
-
-        if let Some(strategy) = strategy {
-            self.host_route_strategy.insert(host.to_string(), strategy);
-        }
-    }
-
-    pub fn set_proxy_server_direct_ip(&self, host: &str, direct_ip_addr: Ipv4Addr) {
-        let strategy = match self.host_route_strategy.get_mut(host) {
-            None => None,
-            Some(kv_ref) => {
-                match kv_ref.value() {
-                    HostRouteStrategy::Probe(tested, need_proxy, ip_addr, port, _, _) => {
-                        Some(HostRouteStrategy::Probe(*tested, *need_proxy, ip_addr.to_string(), *port, Some(direct_ip_addr), NatSessionManager::get_now_time()))
-                    }
-                    _ => None
-                }
-            }
-        };
-
-        if let Some(strategy) = strategy {
-            self.host_route_strategy.insert(host.to_string(), strategy);
-        }
+            .filter(Option::is_some)
+            .map(Option::unwrap)
+            .collect()
     }
 }
 
-pub struct ProxyServerConfigManager {
-    pub proxy_server_configs: voluntary_servitude::VS<(ProxyServerConfig)>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NetworkInterface {
+    pub interface_name: String,
+    pub ip_addr: String,
 }
 
-impl Default for ProxyServerConfigManager {
-    fn default() -> Self {
-        Self {
-            proxy_server_configs: Default::default()
+impl NetworkInterface {
+    pub fn get_copy(&self) -> NetworkInterface {
+        NetworkInterface {
+            interface_name: self.interface_name.to_string(),
+            ip_addr: self.ip_addr.to_string()
         }
-    }
-}
-
-impl ProxyServerConfigManager {
-
-    pub fn add_config(&self, config: ProxyServerConfig) -> anyhow::Result<()> {
-        for server_config in &mut self.proxy_server_configs.iter() {
-            if server_config.name == config.name {
-                return Err(anyhow::anyhow!(format!("already contain config {} ", config.name)))
-            }
-        }
-
-        self.proxy_server_configs.append(config);
-        Ok(())
-    }
-
-    pub fn remove_config(&self, config_name: String) {
-        let new_configs = voluntary_servitude::VS::new();
-        for config in &mut self.proxy_server_configs.iter() {
-            if config.name != config_name {
-                new_configs.append(config.get_copy());
-            }
-        }
-
-        if new_configs.len() != self.proxy_server_configs.len() {
-            self.proxy_server_configs.swap(&new_configs);
-        }
-    }
-
-    pub fn update_config(&self, new_config: ProxyServerConfig) {
-        let new_configs = voluntary_servitude::VS::new();
-        for config in &mut self.proxy_server_configs.iter() {
-            if config.name == new_config.name {
-                new_configs.append(new_config.get_copy());
-            } else {
-                new_configs.append(config.get_copy());
-            }
-        }
-        self.proxy_server_configs.swap(&new_configs);
-    }
-
-    pub fn get_config_list(&self) -> Vec<ProxyServerConfig> {
-        let mut config_list = Vec::with_capacity(self.proxy_server_configs.len());
-        for server_config in &mut self.proxy_server_configs.iter() {
-            config_list.push(server_config.get_copy())
-        }
-        config_list
-    }
-}
-
-pub struct ProxyServerConfig{
-    pub name: String,
-    pub addr: String,
-    pub port: u16,
-    pub available: bool,
-
-    // TODO:
-    // type(socks, http, etc.)
-    // option password, username
-}
-
-impl ProxyServerConfig {
-    pub fn get_copy(&self) -> ProxyServerConfig {
-        ProxyServerConfig {
-            name: self.name.clone(),
-            addr: self.addr.clone(),
-            port: self.port,
-            available: self.available
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum HostRouteStrategy {
-    Direct,
-
-    /// Proxy(proxy_server_addr, proxy_server_port, cached, direct_proxy_server_ip, last_update_time)
-    Proxy(String, u16, Option<Ipv4Addr>, u64),
-
-    /// Probe(tested, need_proxy, proxy_server_addr, proxy_server_port, proxy_server_direct_ip, last_update_time)
-    Probe(bool, bool, String, u16, Option<Ipv4Addr>, u64),
-
-    Reject,
-}
-
-impl HostRouteStrategy {
-
-    pub fn get_copy(&self) -> HostRouteStrategy {
-        let route_strategy = match self {
-            HostRouteStrategy::Direct => HostRouteStrategy::Direct,
-            HostRouteStrategy::Proxy(addr, port, direct_ip, last_update_time) => HostRouteStrategy::Proxy(addr.to_string(), *port, *direct_ip, *last_update_time),
-            HostRouteStrategy::Probe(tested, need_proxy, addr, port, direct_ip, last_update_time) => HostRouteStrategy::Probe(*tested, *need_proxy, addr.to_string(), *port, *direct_ip, *last_update_time),
-            HostRouteStrategy::Reject => HostRouteStrategy::Reject
-        };
-        return route_strategy
-    }
-}
-
-pub struct StreamPipe<S, D> where S: AsyncRead + AsyncWrite, D: AsyncRead + AsyncWrite{
-    pub buf_size: usize,
-    pub src_stream: S,
-    pub dst_stream: D
-}
-
-impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRead + AsyncWrite + Unpin {
-
-    pub fn new(buf_size: usize, src_stream: S, dst_stream: D) -> Self {
-        StreamPipe { buf_size, src_stream, dst_stream }
-    }
-
-    pub async fn pipe_loop(&mut self) {
-        let mut src_to_dst_buf = BytesMut::with_capacity(self.buf_size);
-        let mut dst_to_src_buf = BytesMut::with_capacity(self.buf_size);
-
-        loop {
-            tokio::select! {
-              // handle src to dst pipe
-              read_size = self.src_stream.read_buf(&mut src_to_dst_buf) => {
-                let size = match read_size {
-                  Ok(size) => {size as usize}
-                  Err(errors) => {break}
-                };
-
-                if size <= 0 {
-                    log::info!("**********dst write close");
-                    break;
-                }
-
-                self.dst_stream.write_buf(&mut src_to_dst_buf).await;
-              },
-
-              // handle dst to dst pipe
-              write_size = self.dst_stream.read_buf(&mut dst_to_src_buf) => {
-                let size = match write_size {
-                     Ok(size) => {
-                         size as usize
-                     }
-                     Err(errors) => {
-                         break;
-                     }
-                };
-
-                if size <= 0 {
-                    log::info!("**********src write close");
-                    break;
-                }
-                self.src_stream.write_buf(&mut dst_to_src_buf).await;
-              }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-pub mod tests {
-    use crate::{setup_log, HostRouteManager, HostRouteStrategy};
-    use crate::HostRouteStrategy::{Proxy, Probe};
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::str::FromStr;
-    use regex::Captures;
-    use tokio::net::{TcpStream, ToSocketAddrs};
-    use std::io::Error;
-    use tokio::time::Duration;
-    use tokio::io;
-
-    #[test]
-    pub fn test_host_route_manager() {
-        setup_log();
-        log::info!("test");
-
-        let route = HostRouteManager::new(vec![
-            ("google.com".to_string(), Proxy("www.baidu1.com".to_string(), 80, None, 0)),
-            ("facebook.com".to_string(), Probe(false, false, "www.baidu2.com".to_string(), 80, None, 0)),
-            ("www.youtube.com".to_string(), Proxy("www.bing3.com".to_string(), 80, None, 0))
-        ]);
-
-        let host = "www.facebook.com";
-        match route.get_route_strategy(host) {
-            None => {
-                log::info!("get host {} strategy invalid", host);
-            }
-            Some(strategy) => {
-                log::info!("get host {} strategy {:?}", host, strategy);
-            }
-        }
-        log::info!("first get complete");
-
-        route.mark_probe_direct(host, true);
-        match route.get_route_strategy(host) {
-            None => {
-                log::info!("get host {} strategy invalid", host);
-            }
-            Some(strategy) => {
-                log::info!("get host {} strategy {:?}", host, strategy);
-            }
-        }
-    }
-
-    #[test]
-    pub fn test_regex() {
-        setup_log();
-        let regex_a = regex::Regex::from_str("github.com").unwrap();
-        match regex_a.captures("www.github.com") {
-            None => {
-                log::info!("capture empty")
-            }
-            Some(_) => {
-                log::info!("capture valid")
-            }
-        }
-    }
-
-    #[test]
-    pub fn test_tokio_connect_timeout() {
-        setup_log();
-        let run_time = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(run_time) => {
-                run_time
-            },
-            Err(errors) => {
-                log::error!("create runtime error, {}", errors);
-                return
-            }
-        };
-        run_time.block_on(async {
-            log::info!("connect start");
-            let timeout_sec = Duration::from_secs(5);
-            let connected_socket = tokio::select! {
-                connected_socket = TcpStream::connect(("108.160.166.137", 443)) => {
-                    match connected_socket {
-                        Ok(socket) => {
-                            Some(socket)
-                        }
-                        Err(errors) => {
-                            None
-                        }
-                    }
-                }
-
-                _ = tokio::time::sleep(timeout_sec) => {
-                    None
-                }
-            };
-            log::info!("connect end");
-        });
     }
 }
