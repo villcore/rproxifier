@@ -7,6 +7,14 @@
 * 1. wintun + fakeIp (master分支)
 * 2. windivert流量过滤方式实现（redirect分支）
 
+### 相比Proxifier优点
+1. 支持全局流量自定义转发
+2. 支持进程流量自定义转发
+3. 支持进程 + host自定义转发
+
+### 已知问题
+部分游戏转发有问题，COD16会闪退，原因未知
+
 ### 截图展示
 gui为[rproxifier-gui（Java Swing）项目](!https://github.com/villcore/rproxifier-gui)，使用http调用数据接口
 
