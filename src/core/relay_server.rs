@@ -9,7 +9,7 @@ use crate::core::StreamPipe;
 use crate::core::host_route_manager::HostRouteManager;
 use crate::core::proxy_config_manager::{HostRouteStrategy, ProxyServerConfig, ProxyServerConfigType, ConnectionRouteRule, RouteRule};
 use crate::{ProxyServerConfigManager, SystemManager, ProcessInfo};
-use crate::core::active_connection_manager::{ActiveConnectionManager, ActiveConnection};
+use crate::core::active_connection_manager::{ActiveConnectionManager, ActiveConnection, ConnectionTransferType};
 use crate::core::dns_manager::DnsConfigManager;
 use std::io::Error;
 
@@ -31,8 +31,6 @@ impl TcpRelayServer {
     pub async fn run(&self) {
         self.run_session_port_recycler();
 
-       self.run_udp_server();
-
         // bind address
         self.run_tcp_server().await;
     }
@@ -52,7 +50,7 @@ impl TcpRelayServer {
 
     async fn run_tcp_server(&self) {
         // TODO: modify
-        let listen_addr = (Ipv4Addr::new(10, 0, 0, 1), 1300);
+        let listen_addr = (Ipv4Addr::new(0, 0, 0, 0), 13000);
         let tcp_listener = match TcpListener::bind(listen_addr).await {
             Ok(_tcp_listener) => {
                 _tcp_listener
@@ -95,6 +93,17 @@ impl TcpRelayServer {
                 let dns_config_manager = self.dns_config_manager.clone();
 
                 tokio::spawn(async move {
+                    let dst_addr_bytes = dst_addr.octets();
+                    let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
+                    let origin_host_port = match fake_ip_manager.get_host(&fake_ip) {
+                        None => {
+                            log::error!("get host from fake_ip {} error", dst_addr.to_string());
+                            return
+                        }
+
+                        Some(host) => (host, dst_port)
+                    };
+
                     let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
                         let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
                         let process_info = process_manager.get_process(pid)
@@ -111,61 +120,11 @@ impl TcpRelayServer {
                             process_execute_path: "".to_string(),
                         })
                     }.unwrap();
-
-                    let dst_addr_bytes = dst_addr.octets();
-                    let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
-                    let origin_host_port = match fake_ip_manager.get_host(&fake_ip) {
-                        None => {
-                            log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                            return
-                        }
-
-                        Some(host) => (host, dst_port)
-                    };
-
-                    let process_name = process_info.process_name.clone();
-                    dns_config_manager.add_related_process(origin_host_port.0.clone(), process_name);
-
-                    let (rule_strategy, connection_route_rule) = match host_route_manager.get_host_route_strategy(Some(process_info.get_copy()), &origin_host_port.0) {
-                        None => (HostRouteStrategy::Direct, ConnectionRouteRule {
-                            hit_global_rule: false,
-                            hit_process_rule: false,
-                            need_proxy: false,
-                            host_regex: "".to_string(),
-                            route_rule: RouteRule::Direct
-                        }),
+                    let (rule_strategy, _) = match host_route_manager.get_host_route_strategy(Some(&process_info), &origin_host_port.0) {
+                        None => (HostRouteStrategy::Direct, ConnectionRouteRule::new()),
                         Some(strategy) => strategy
                     };
-
                     match rule_strategy {
-                        HostRouteStrategy::Direct => {
-                            let direct_address_port = TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy, fake_ip_manager).await;
-                            let (host, port) = match direct_address_port {
-                                None => {
-                                    log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                                    return
-                                }
-                                Some((real_host, real_port)) => (real_host.to_string(), real_port)
-                            };
-
-                            let mut dst_socket = match TcpStream::connect((host.as_str(), port)).await {
-                                Ok(dst_socket) => {
-                                    log::info!("session {} => connect real_addr {}:{}", session_port, &host, port);
-                                    dst_socket
-                                }
-                                Err(errors) => {
-                                    log::error!("session {} => connect real addr {}:{} error, {}", session_port, &host, port, errors);
-                                    return;
-                                }
-                            };
-
-                            // TODO: add connection
-
-                            TcpRelayServer::add_active_connection(session_port, src_addr, src_port, dst_port, &active_connection_manager, connection_route_rule,Some(process_info.get_copy()), &origin_host_port);
-                            let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), 4096, tcp_socket, dst_socket);
-                            stream_pipe.pipe_loop().await;
-                        }
-
                         HostRouteStrategy::Proxy(proxy_config_name, direct_ip, last_update_time) => {
                             // host_route_manager
                             // TODO: dns_lookup cache.
@@ -196,205 +155,25 @@ impl TcpRelayServer {
                             let mut proxy_socket = tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await.unwrap();
                             // TODO: add connection
 
-                            TcpRelayServer::add_active_connection(session_port, src_addr, src_port, dst_port, &active_connection_manager, connection_route_rule, Some(process_info.get_copy()), &origin_host_port);
+                            // TcpRelayServer::add_active_connection(session_port, src_addr, src_port, dst_port, &active_connection_manager, connection_route_rule, Some(process_info.get_copy()), &origin_host_port);
                             let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(),4096, tcp_socket, proxy_socket);
                             stream_pipe.pipe_loop().await
                         }
-
-                        HostRouteStrategy::Probe(tested, need_proxy, proxy_config_name, direct_ip, last_update_time) => {
-                            let mut need_proxy = need_proxy;
-                            let (dst_socket, direct_connected) = if !tested {
-                                if !need_proxy {
-                                    let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy.clone(), fake_ip_manager).await {
-                                        None => None,
-                                        Some(direct_ip_port) => Some(direct_ip_port)
-                                    };
-
-                                    let test_dst_socket = match direct_address_port {
-                                        None => (None, false),
-                                        Some(direct_address_port) => {
-                                            log::info!("connect to {}:{}", direct_address_port.0, direct_address_port.1);
-                                            match TcpRelayServer::connect_with_timeout(direct_address_port, Duration::from_secs(3)).await {
-                                                Ok(mut dst_socket) => (Some(dst_socket), true),
-                                                Err(errors) => {
-                                                    log::info!("try connect to timeout, {}", errors);
-                                                    (None, false)
-                                                },
-                                            }
-                                        }
-                                    };
-                                    host_route_manager.mark_probe_host_need_proxy(&origin_host_port.0);
-                                    test_dst_socket
-                                } else {
-                                    (None, false)
-                                }
-                            } else {
-                                if !need_proxy {
-                                    let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver_copy.clone(), fake_ip_manager).await {
-                                        None => return,
-                                        Some(direct_ip_port) => Some(direct_ip_port)
-                                    };
-
-                                    match direct_address_port {
-                                        None => return,
-                                        Some(direct_address_port) => {
-                                            log::info!("connect to {}:{}", direct_address_port.0, direct_address_port.1);
-                                            match TcpRelayServer::connect_with_timeout(direct_address_port, Duration::from_secs(3)).await {
-                                                Ok(mut dst_socket) => {
-                                                    (Some(dst_socket), true)
-                                                },
-                                                Err(_errors) => {
-                                                    host_route_manager.mark_probe_host_need_proxy(&origin_host_port.0, );
-                                                    (None, false)
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    (None, !need_proxy)
-                                }
-                            };
-
-                            if direct_connected {
-                                TcpRelayServer::add_active_connection(session_port, src_addr, src_port, dst_port, &active_connection_manager, connection_route_rule, Some(process_info.get_copy()), &origin_host_port);
-                                let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), 4096, tcp_socket, dst_socket.unwrap());
-                                stream_pipe.pipe_loop().await
-                            } else {
-                                let (addr, port) = match proxy_server_config_manager.get_proxy_server_config(proxy_config_name.as_str()) {
-                                    None => {
-                                        log::error!("get proxy server {} error", proxy_config_name);
-                                        return;
-                                    }
-                                    Some(proxy_config) => {
-                                        match proxy_config.config {
-                                            ProxyServerConfigType::SocksV5(addr, port, _, _) => {
-                                                (addr, port)
-                                            }
-                                            _ => {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                };
-                                // proxy
-                                let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &addr, port).await {
-                                    None => {
-                                        return
-                                    },
-                                    Some((ip, port)) => (ip, port)
-                                };
-
-                                let target_addr = format!("{}:{}", origin_host_port.0, origin_host_port.1);
-                                let mut proxy_socket = tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await.unwrap();
-                                // TODO: add connection
-
-                                TcpRelayServer::add_active_connection(session_port, src_addr, src_port, dst_port, &active_connection_manager, connection_route_rule, Some(process_info.get_copy()), &origin_host_port);
-                                let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), 4096, tcp_socket, proxy_socket);
-                                stream_pipe.pipe_loop().await
-                            }
-                        }
-
-                        HostRouteStrategy::Reject => {
-                            log::info!("reject connection to {}:{}",origin_host_port.0, origin_host_port.1)
+                        _ => {
+                            return;
                         }
                     }
-                    active_connection_manager.remove_connection(session_port);
                 });
             }
         }
     }
 
-    fn run_udp_server(&self) {
-        // tokio::spawn(async {
-        //     let net_session_manager = self.nat_session_manager.clone();
-        //     let udp_listener = UdpSocket::bind("0.0.0.0:1300").await;
-        // });
-        // let net_session_manager = self.nat_session_manager.clone();
-        // let mut nat_session_manager = match net_session_manager.lock() {
-        //     Ok(nat_session_manager) => nat_session_manager,
-        //     Err(errors) => {
-        //         log::error!("get nat session manager error, {}", errors);
-        //         return
-        //     }
-        // };
-        //
-        // let resolver = self.resolver.clone();
-        // let fake_ip_manager = self.fake_ip_manager.clone();
-        // let host_route_manager = self.host_route_manager.clone();
-        // let proxy_server_config_manager = self.proxy_server_config_manager.clone();
-        // let active_connection_manager = self.active_connection_manager.clone();
-        // let mut process_manager = self.process_manager.clone();
-        // let dns_config_manager = self.dns_config_manager.clone();
-
-        // udp server.
-        // let udp_listener = match UdpSocket::bind("0.0.0.0:1300").await {
-        //     Ok(udp_socket) => {
-        //         Arc::new(udp_socket)
-        //     }
-        //     Err(errors) => {
-        //         log::error!("bind udp socket error, {}", errors.to_string());
-        //         return
-        //     }
-        // };
-
-        // let mut buf = vec![0; 4090];
-        //
-        // loop {
-        //     let (size, peer_addr) = match udp_listener.recv_from(&mut buf).await {
-        //         Ok(result) => result,
-        //         Err(errors) => {
-        //             log::error!("rece form udp socket error, {}", errors.to_string());
-        //             return
-        //         }
-        //     };
-            // let session_port = peer_addr.port();
-            // let (src_addr, src_port, dst_addr, dst_port)= match nat_session_manager.get_port_session_tuple(session_port) {
-            //     None => {
-            //         log::error!("get session port {} udp session tuple error ", session_port);
-            //         return;
-            //     }
-            //     Some(r) => r,
-            // };
-            //
-            // let dst_addr_bytes = dst_addr.octets();
-            // let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
-            // let origin_host_port = match fake_ip_manager.get_host(&fake_ip) {
-            //     None => {
-            //         log::error!("get host from fake_ip {} error", dst_addr.to_string());
-            //         return
-            //     }
-            //
-            //     Some(host) => (host, dst_port)
-            // };
-            //
-            // let direct_address_port = match TcpRelayServer::resolve_direct_ip_port(dst_addr, dst_port, resolver.clone(), fake_ip_manager.clone()).await {
-            //     None => {
-            //         log::error!("get udp socket dst addr error");
-            //         return
-            //     }
-            //
-            //     Some(result) => result
-            // };
-            //
-            // log::info!(">>>>>>>>>>>>>>>> udp dst addr = {}:{}", direct_address_port.0, direct_address_port.1);
-            // let dst_udp_socket: UdpSocket;
-            // dst_udp_socket.send_to(&buf[..size], ).await;
-            //
-            // match timeout(write_timeout, socket.send_to(&buf[..size], dest_addr)).await {
-            //     Ok(send_size) => {
-            //         assert_eq!(size, send_size);
-            //     }
-            //     Err(e) => error!(?e, "send to {}", dest_addr),
-            // };
-            // self.session_manager.update_activity_for_port(session_port);
-        // }
-    }
-
-    fn add_active_connection(session_port: u16, src_addr: Ipv4Addr, src_port: u16, dst_port: u16,
-                             active_connection_manager: &Arc<ActiveConnectionManager>,
-                             connection_route_rule: ConnectionRouteRule,
-                             process_info: Option<ProcessInfo>,
-                             origin_host_port: &(String, u16)) {
+    pub(crate) fn add_active_connection(session_port: u16, src_addr: Ipv4Addr, src_port: u16, dst_port: u16,
+                                        active_connection_manager: &Arc<ActiveConnectionManager>,
+                                        connection_route_rule: ConnectionRouteRule,
+                                        transfer_type: ConnectionTransferType,
+                                        process_info: Option<ProcessInfo>,
+                                        origin_host_port: &(String, u16)) {
 
         let process_info = process_info
             .unwrap_or_else(|| ProcessInfo {
@@ -412,6 +191,7 @@ impl TcpRelayServer {
             dst_addr: origin_host_port.0.clone(),
             dst_port,
             route_rule: connection_route_rule,
+            transfer_type,
             tx: 0,
             rx: 0,
             start_timestamp: NatSessionManager::get_now_time(),

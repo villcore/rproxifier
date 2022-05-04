@@ -51,6 +51,16 @@ pub struct ConnectionRouteRule {
 }
 
 impl ConnectionRouteRule {
+    pub fn new() -> ConnectionRouteRule {
+        Self {
+            hit_global_rule: false,
+            hit_process_rule: false,
+            need_proxy: false,
+            host_regex: "".to_string(),
+            route_rule: RouteRule::Direct
+        }
+    }
+
     pub fn get_copy(&self) -> ConnectionRouteRule {
         ConnectionRouteRule {
             hit_global_rule: self.hit_global_rule,

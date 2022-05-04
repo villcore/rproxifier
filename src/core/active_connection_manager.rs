@@ -17,6 +17,7 @@ pub struct ActiveConnection {
     pub dst_addr: String,
     pub dst_port: u16,
     pub route_rule: ConnectionRouteRule,
+    pub transfer_type: ConnectionTransferType,
 
     // current trans
     pub tx: usize,
@@ -55,6 +56,21 @@ pub struct ActiveConnectionView {
     pub start_timestamp: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ConnectionTransferType {
+    TCP,
+    UDP
+}
+
+impl ToString for ConnectionTransferType {
+    fn to_string(&self) -> String {
+        match self {
+            ConnectionTransferType::TCP => "TCP".to_string(),
+            ConnectionTransferType::UDP => "UDP".to_string()
+        }
+    }
+}
+
 impl ActiveConnection {
 
     pub fn incr_rx(&mut self, bytes: usize) {
@@ -73,7 +89,7 @@ impl ActiveConnection {
             process_name: self.process_name.to_string(),
             process_execute_path: self.process_execute_path.to_string(),
             session_port: self.session_port,
-            src_addr: self.src_addr.to_string(),
+            src_addr: self.src_addr.to_string() + "   (" + &self.transfer_type.to_string() + ")",
             src_port: self.src_port,
             dst_addr: self.dst_addr.to_string(),
             dst_port: self.dst_port,
@@ -119,6 +135,10 @@ impl ActiveConnectionManager {
     pub fn remove_connection(&self, session_port: u16) -> anyhow::Result<()> {
         self.connection_map.remove(&session_port);
         Ok(())
+    }
+
+    pub fn contains_connection(&self, session_port: u16) -> bool {
+        self.connection_map.contains_key(&session_port)
     }
 
     pub fn incr_rx(&self, session_port: u16, bytes: usize) -> anyhow::Result<()>  {

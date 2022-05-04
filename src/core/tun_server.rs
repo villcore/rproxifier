@@ -61,9 +61,13 @@ impl TunServer {
 
         // windows sleep for a while
         #[cfg(target_os = "windows")]
-            sleep(Duration::from_secs(5));
+        sleep(Duration::from_secs(5));
 
         stared_event_sender.send(true);
+
+        #[cfg(target_os = "windows")]
+        return;
+
         let relay_addr = self.relay_addr;
         let relay_port = self.relay_port;
         self.run_ip_packet_transfer(tun_socket, relay_addr, relay_port);

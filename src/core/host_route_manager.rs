@@ -29,12 +29,12 @@ impl HostRouteManager {
         }
     }
 
-    pub fn get_host_route_strategy(&self, process_info: Option<ProcessInfo>, host: &str) -> Option<(HostRouteStrategy, ConnectionRouteRule)> {
+    pub fn get_host_route_strategy(&self, process_info: Option<&ProcessInfo>, host: &str) -> Option<(HostRouteStrategy, ConnectionRouteRule)> {
         let need_proxy = self.is_probe_host_need_proxy(host);
         if let Some(process_info) = process_info {
             // process
-            let process_path = process_info.process_execute_path;
-            match self.get_process_route_rule(&process_path) {
+            let process_path = process_info.process_execute_path.as_str();
+            match self.get_process_route_rule(process_path) {
                 None => {}
                 Some(process_route_rule) => {
                     if process_route_rule.len() > 0 {

@@ -40,12 +40,14 @@ use crate::sys::sys::{DNSSetup, set_rlimit, setup_ip_route};
 use crate::sys::sys::DNSSetup;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
+use dns_parser::rdata::Opt;
 use sled::IVec;
 use sysinfo::{SystemExt, ProcessExt, PidExt, Process, NetworkExt};
 use crate::core::host_route_manager::HostRouteManager;
 use crate::core::proxy_config_manager::{HostRouteStrategy, ProxyServerConfigManager, ProxyServerConfig, ProxyServerConfigType, RegexRouteRule, ProcessRegexRouteRule};
 use crate::core::active_connection_manager::ActiveConnectionManager;
 use netstat2::{ProtocolSocketInfo, SocketInfo};
+use crate::core::windivert::{Ipv4PacketInterceptor, TestPacketInterceptor};
 use crate::sys::sys::get_gateway;
 
 mod dns;
@@ -261,6 +263,30 @@ impl App {
         let background_network = network.clone();
         spawn(move || background_network.run());
         // network.setup_dns();
+
+        let mut network_module = self.network_module.clone();
+        spawn(move || {
+            let ipv4_packet_interceptor = Ipv4PacketInterceptor {
+                nat_session_manager: network_module.nat_session_manager.clone(),
+                fake_ip_manager: network_module.fake_ip_manager.clone(),
+                proxy_config_manager: network_module.proxy_server_config_manager.clone(),
+                process_manager: network_module.system_manager.clone(),
+                connection_manager: network_module.active_connection_manager.clone(),
+                host_route_manager: network_module.host_route_manager.clone()
+            };
+
+            ipv4_packet_interceptor.run();
+        });
+
+        let mut network_module = self.network_module.clone();
+        spawn(move || {
+            let ipv4_packet_interceptor = TestPacketInterceptor {
+                nat_session_manager: network_module.nat_session_manager.clone(),
+                fake_ip_manager: network_module.fake_ip_manager.clone()
+            };
+
+            ipv4_packet_interceptor.run();
+        });
     }
 
     pub fn setup_dns(&self) {
@@ -410,6 +436,12 @@ impl NetworkModule {
     }
 
     pub fn run_sync_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>, stared_event_sender: std::sync::mpsc::Sender<bool>) {
+        #[cfg(target_os = "windows")]
+        {
+            stared_event_sender.send(true);
+            return;
+        }
+
         log::info!("run sync component");
         // start tun_server
         let mut tun_server = TunServer {
@@ -461,7 +493,7 @@ impl NetworkModule {
                 dns_listen: "127.0.0.1:53".to_string(),
             };
             log::info!("start run dns sever");
-            dns_server.run_dns_server();
+            // dns_server.run_dns_server();
             log::info!("start run dns sever complete");
 
             // tcp_relay_server
@@ -689,6 +721,10 @@ impl SystemManager {
             .filter(Option::is_some)
             .map(Option::unwrap)
             .collect()
+    }
+
+    pub fn get_available_processor_num(&self) -> Option<usize> {
+        Some(num_cpus::get_physical())
     }
 }
 
