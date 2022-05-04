@@ -5,7 +5,7 @@
 #### macos使用了tun + fakeIp 的方式实现（master分支）
 #### windows使用了两种方式实现
 * 1. wintun + fakeIp (master分支)
-* 2. windivert流量过滤方式实现（windows分支）
+* 2. windivert流量过滤方式实现（redirect分支）
 
 ### 截图展示
 gui为[rproxifier-gui（Java Swing）项目](!https://github.com/villcore/rproxifier-gui)，使用http调用数据接口
