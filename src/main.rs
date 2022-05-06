@@ -47,7 +47,7 @@ use crate::core::host_route_manager::HostRouteManager;
 use crate::core::proxy_config_manager::{HostRouteStrategy, ProxyServerConfigManager, ProxyServerConfig, ProxyServerConfigType, RegexRouteRule, ProcessRegexRouteRule};
 use crate::core::active_connection_manager::ActiveConnectionManager;
 use netstat2::{ProtocolSocketInfo, SocketInfo};
-use crate::core::windivert::{Ipv4PacketInterceptor, TestPacketInterceptor};
+use crate::core::windivert::{Ipv4PacketInterceptor};
 use crate::sys::sys::get_gateway;
 
 mod dns;
@@ -277,16 +277,6 @@ impl App {
 
             ipv4_packet_interceptor.run();
         });
-
-        let mut network_module = self.network_module.clone();
-        spawn(move || {
-            let ipv4_packet_interceptor = TestPacketInterceptor {
-                nat_session_manager: network_module.nat_session_manager.clone(),
-                fake_ip_manager: network_module.fake_ip_manager.clone()
-            };
-
-            ipv4_packet_interceptor.run();
-        });
     }
 
     pub fn setup_dns(&self) {
@@ -464,7 +454,11 @@ impl NetworkModule {
                                dns_config_manager: Arc<DnsConfigManager>) {
 
         log::info!("run async component");
-        let run_time = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let run_time = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build() {
+
             Ok(run_time) => {
                 run_time
             }
