@@ -456,7 +456,8 @@ impl NetworkModule {
         log::info!("run async component");
         let run_time = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .worker_threads(1)
+            .worker_threads(process_manager.get_available_processor_num())
+            .max_blocking_threads(process_manager.get_available_processor_num() * 2)
             .build() {
 
             Ok(run_time) => {
@@ -589,7 +590,18 @@ pub struct ProcessInfo {
     pub process_execute_path: String,
 }
 
+impl Default for ProcessInfo {
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            process_name: "".to_string(),
+            process_execute_path: "".to_string()
+        }
+    }
+}
+
 impl ProcessInfo {
+
     pub fn get_copy(&self) -> ProcessInfo {
         ProcessInfo {
             pid: self.pid,
@@ -717,8 +729,13 @@ impl SystemManager {
             .collect()
     }
 
-    pub fn get_available_processor_num(&self) -> Option<usize> {
+    fn get_available_processor_num_inner(&self) -> Option<usize> {
         Some(num_cpus::get_physical())
+    }
+
+    pub fn get_available_processor_num(&self) -> usize {
+        Some(num_cpus::get_physical())
+            .map_or(1, |core_num| std::cmp::max(core_num, 1))
     }
 }
 

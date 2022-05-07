@@ -107,18 +107,10 @@ impl TcpRelayServer {
                     let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
                         let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
                         let process_info = process_manager.get_process(pid)
-                            .unwrap_or_else(|| ProcessInfo {
-                                pid: 0,
-                                process_name: "".to_string(),
-                                process_execute_path: "".to_string(),
-                            });
-                        Some(process_info)
+                            .unwrap_or_else(|| ProcessInfo::default());
+                        Some(ProcessInfo::default())
                     } else {
-                        Some(ProcessInfo {
-                            pid: 0,
-                            process_name: "".to_string(),
-                            process_execute_path: "".to_string(),
-                        })
+                        Some(ProcessInfo::default())
                     }.unwrap();
                     let (rule_strategy, _) = match host_route_manager.get_host_route_strategy(Some(&process_info), &origin_host_port.0) {
                         None => (HostRouteStrategy::Direct, ConnectionRouteRule::new()),
