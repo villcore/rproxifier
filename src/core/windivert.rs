@@ -8,10 +8,12 @@ use std::str::FromStr;
 use std::sync::mpsc::{channel, Sender, sync_channel, SyncSender};
 use std::thread::sleep;
 use std::time::Duration;
+use dashmap::DashMap;
 use dns_parser::RData;
 use smoltcp::wire::{IpProtocol, UdpPacket, TcpPacket, Ipv4Packet};
 use smoltcp::Error;
 use dns_parser::rdata::A;
+use log::info;
 use rouille::url::quirks::host;
 use windivert::address::WinDivertNetworkData;
 use crate::{ActiveConnectionManager, HostRouteManager, HostRouteStrategy, NatSessionManager, ProcessInfo, ProxyServerConfigManager, ProxyServerConfigType, SystemManager, TcpRelayServer};
@@ -22,6 +24,7 @@ const UDP_BUFFER_SIZE: usize = 64 * 1024;
 const TCP_BUFFER_SIZE: usize = 16 * 1024;
 
 pub struct Ipv4PacketInterceptor {
+    pub session_route_strategy: Arc<DashMap<u16, HostRouteStrategy>>,
     pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
     pub fake_ip_manager: Arc<FakeIpManager>,
     pub proxy_config_manager: Arc<ProxyServerConfigManager>,
@@ -49,7 +52,6 @@ impl Ipv4PacketInterceptor {
             }
         });
 
-        let dummy_process_info: ProcessInfo = ProcessInfo::default();
         let local_host_ip_addr_octets = Ipv4Addr::from_str("127.0.0.1").unwrap().octets();
         let relay_server_port = 13000u16;
         let filter = "ip";
@@ -80,11 +82,14 @@ impl Ipv4PacketInterceptor {
             let proxy_config_manager = self.proxy_config_manager.clone();
             let process_manager = self.process_manager.clone();
             let connection_manager = self.connection_manager.clone();
+            let session_route_strategy = self.session_route_strategy.clone();
+
             std::thread::spawn(move || {
+                let dummy_proxy = HostRouteStrategy::Proxy(String::from(""), None, 0);
                 let mut proxy_server_host_set: HashSet<String> = HashSet::with_capacity(16);
                 let mut host_route_strategy_map: HashMap<u16, (HostRouteStrategy, ProcessInfo)> = HashMap::with_capacity(512);
+                let mut host_route_strategy_map: HashMap<u16, (HostRouteStrategy, ProcessInfo)> = HashMap::with_capacity(512);
                 loop {
-                    //
                     match rx.recv() {
                         Ok((addr, mut ipv4_packet)) => {
                             let outbound = addr.outbound();
@@ -110,7 +115,7 @@ impl Ipv4PacketInterceptor {
                                         let host = match fake_ip_manager.get_host(&(dst_addr_octets[0], dst_addr_octets[1], dst_addr_octets[2], dst_addr_octets[3])) {
                                             None => {
                                                 let data = ipv4_packet.into_inner();
-                                                handle.send(WinDivertParsedPacket::Network { addr,  data});
+                                                handle.send(WinDivertParsedPacket::Network { addr, data });
                                                 continue;
                                             }
                                             Some(host) => host
@@ -194,7 +199,6 @@ impl Ipv4PacketInterceptor {
 
                                     let src_port = tcp_packet.src_port();
                                     let dst_port = tcp_packet.dst_port();
-                                    //
                                     let dst_addr_octets = dst_addr.octets();
                                     let src_addr_octets = src_addr.octets();
 
@@ -220,54 +224,62 @@ impl Ipv4PacketInterceptor {
 
                                         // let seq_number = tcp_packet.seq_number();
                                         if tcp_packet.syn() {
-                                            if let Some(proxy_server_config_vec) = proxy_config_manager.get_all_proxy_server_config() {
-                                                for proxy_server_config in proxy_server_config_vec {
-                                                    match proxy_server_config.config {
-                                                        ProxyServerConfigType::SocksV5(addr, _, _, _) => {
-                                                            proxy_server_host_set.insert(addr);
+                                            if src_port != relay_server_port {
+                                                if let Some(proxy_server_config_vec) = proxy_config_manager.get_all_proxy_server_config() {
+                                                    for proxy_server_config in proxy_server_config_vec {
+                                                        match proxy_server_config.config {
+                                                            ProxyServerConfigType::SocksV5(addr, _, _, _) => {
+                                                                proxy_server_host_set.insert(addr);
+                                                            }
+                                                            _ => {}
                                                         }
-                                                        _ => {}
                                                     }
                                                 }
+                                                // log::info!("------- new tcp pipe {} -> {}:{} -> {}:{} -> seq_num {}", &host, src_addr, src_port, dst_addr, dst_port, seq_number);
+                                                let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
+                                                    let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
+                                                    let process_info = process_manager.get_process(pid)
+                                                        .unwrap_or_else(|| ProcessInfo::default());
+                                                    Some(process_info)
+                                                } else {
+                                                    Some(ProcessInfo::default())
+                                                }.unwrap();
+                                                let mut connection_route_rule = ConnectionRouteRule::new();
+                                                let host_route_manager = host_route_manager.clone();
+                                                let host_route_strategy = match host_route_manager.get_host_route_strategy(Some(&process_info), &host) {
+                                                    None => HostRouteStrategy::Direct,
+                                                    Some((strategy, rule)) => {
+                                                        connection_route_rule = rule;
+                                                        strategy
+                                                    }
+                                                };
+                                                // log::info!(" open transfer {}:{} -> {}:{} -> {:?}", src_addr, src_port, dst_addr, dst_port, host_route_strategy);
+                                                host_route_strategy_map.insert(src_port, (host_route_strategy, process_info.get_copy()));
+                                                TcpRelayServer::add_active_connection(src_port, src_addr, src_port, dst_port, &connection_manager,
+                                                                                      connection_route_rule, ConnectionTransferType::TCP, Some(process_info), &(host, src_port),
+                                                );
                                             }
-
-                                            // log::info!("------- new tcp pipe {} -> {}:{} -> {}:{} -> seq_num {}", &host, src_addr, src_port, dst_addr, dst_port, seq_number);
-                                            let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
-                                                let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
-                                                let process_info = process_manager.get_process(pid)
-                                                    .unwrap_or_else(|| ProcessInfo::default());
-                                                Some(process_info)
-                                            } else {
-                                                Some(ProcessInfo::default())
-                                            }.unwrap();
-                                            // log::info!("process_info = {:?}", process_info);
-                                            let mut connection_route_rule = ConnectionRouteRule::new();
-                                            let host_route_manager = host_route_manager.clone();
-                                            let host_route_strategy = match host_route_manager.get_host_route_strategy(Some(&process_info), &host) {
-                                                None => HostRouteStrategy::Direct,
-                                                Some((strategy, rule)) => {
-                                                    connection_route_rule = rule;
-                                                    strategy
-                                                }
-                                            };
-                                            host_route_strategy_map.insert(src_port, (host_route_strategy, process_info.get_copy()));
-                                            TcpRelayServer::add_active_connection(src_port, src_addr, src_port, dst_port, &connection_manager,
-                                                                                  connection_route_rule, ConnectionTransferType::TCP, Some(process_info), &(host, src_port),
-                                            );
                                         } else if tcp_packet.fin() {
-                                            // log::info!("======= close tcp pipe {}:{} -> {}:{} -> seq_num {}", src_addr, src_port, dst_addr, dst_port, seq_number);
+                                            if src_port != relay_server_port {
+                                                // log::info!("======= close tcp pipe {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
+                                                connection_manager.remove_connection(src_port);
+                                            }
                                         }
 
-                                        // log::info!(" transfer {}:{} -> {}:{} -> seq_num {} -> {:?}", src_addr, src_port, dst_addr, dst_port, seq_number, host_route_strategy);
                                         let mut host_route_strategy = match host_route_strategy_map.get(&src_port) {
                                             None => {
-                                                &HostRouteStrategy::Reject
+                                                if src_port == relay_server_port {
+                                                    &dummy_proxy
+                                                } else {
+                                                    &HostRouteStrategy::Reject
+                                                }
                                             }
                                             Some(b) => {
                                                 &b.0
                                             }
                                         };
 
+                                        // log::info!(" transfer {}:{} -> {}:{} -> {:?}", src_addr, src_port, dst_addr, dst_port, host_route_strategy);
                                         match host_route_strategy {
                                             HostRouteStrategy::Proxy(_, _, _) => {}
                                             HostRouteStrategy::Reject => {
@@ -311,11 +323,10 @@ impl Ipv4PacketInterceptor {
                                             ipv4_packet.fill_checksum();
                                             // log::info!("Relay server Send new >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> {}:{} -> {}:{} / origin {}:{} -> {}:{} -> seq {}", new_src_addr, new_src_port, new_dst_addr, new_dst_port, src_addr, src_port, dst_addr, dst_port, seq_number);
                                             let data = ipv4_packet.into_inner();
-                                            connection_manager.incr_tx(dst_port, data.len());
+                                            connection_manager.incr_rx(new_dst_port, data.len());
                                             handle.send(WinDivertParsedPacket::Network { addr, data });
                                             continue;
                                         } else {
-
                                             // modify tcp packet
                                             let nat_session_manager = nat_session_manager.clone();
                                             let mut nat_session_manager = match nat_session_manager.lock() {
@@ -338,6 +349,9 @@ impl Ipv4PacketInterceptor {
                                                 }
                                                 Some(port) => port
                                             };
+                                            if tcp_packet.syn() {
+                                                session_route_strategy.insert(port, host_route_strategy.get_copy());
+                                            }
 
                                             // TODO: copy data;
                                             let new_src_addr = dst_addr;
@@ -353,6 +367,7 @@ impl Ipv4PacketInterceptor {
                                             ipv4_packet.set_dst_addr(new_dst_addr.into());
                                             ipv4_packet.fill_checksum();
                                             let data = ipv4_packet.into_inner();
+                                            connection_manager.incr_tx(src_port, data.len());
                                             handle.send(WinDivertParsedPacket::Network { addr, data });
                                             continue;
                                         }
@@ -391,7 +406,6 @@ impl Ipv4PacketInterceptor {
                                 Ok(p) => p,
                                 Err(errors) => {
                                     log::error!("read ip_v4 packet error, {}", errors.to_string());
-                                    // handle.send(WinDivertParsedPacket::Network { addr, data });
                                     continue;
                                 }
                             };
@@ -402,12 +416,10 @@ impl Ipv4PacketInterceptor {
                                         Ok(udp_packet) => udp_packet,
                                         Err(errors) => {
                                             log::error!("create udp packet error, {}", errors.to_string());
-                                            // handle.send(WinDivertParsedPacket::Network {addr, data});
                                             continue;
                                         }
                                     };
                                     let src_port = udp_packet.src_port();
-                                    // (src_port, WinDivertParsedPacket::Network {addr, data})
                                     (src_port, addr, ipv4_packet)
                                 }
                                 IpProtocol::Tcp => {
@@ -416,16 +428,13 @@ impl Ipv4PacketInterceptor {
                                         Ok(tcp_packet) => tcp_packet,
                                         Err(errors) => {
                                             log::error!("create tcp packet error, {}", errors.to_string());
-                                            // handle.send(WinDivertParsedPacket::Network { addr, data });
                                             continue;
                                         }
                                     };
                                     let src_port = tcp_packet.src_port();
-                                    // (src_port, WinDivertParsedPacket::Network {addr, data})
                                     (src_port, addr, ipv4_packet)
                                 }
                                 _ => {
-                                    // handle.send(WinDivertParsedPacket::Network { addr, data });
                                     continue;
                                 }
                             }
@@ -438,8 +447,6 @@ impl Ipv4PacketInterceptor {
                     let selected_worker_id = (src_port as usize % worker_num);
                     if let Some(tx) = worker_mpsc.get(&selected_worker_id) {
                         tx.send((addr, ipv4_packet));
-                    } else {
-                        return;
                     }
                 }
                 Err(errors) => {

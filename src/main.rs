@@ -59,9 +59,8 @@ mod api;
 fn main() {
     setup_log();
     let db = Arc::new(core::db::Db::new("data/db"));
-    let mut network = Arc::new(NetworkModule::new("", 10000, db.clone()));
+    let mut network = Arc::new(NetworkModule::new(10000, db.clone()));
     let app = Arc::new(App::new(network));
-    app.clear_dns();
     app.start();
 
     let app_cpy = app.clone();
@@ -70,14 +69,12 @@ fn main() {
             (POST) (/net/start_net) => {
                 let request_body: rouille::RequestBody = request.data().unwrap();
                 let start_network: NetworkInterface = serde_json::from_reader(request_body).unwrap();
-                app_cpy.setup_dns_with_primary_ip(start_network);
                 rouille::Response::json(&true)
             },
 
             (POST) (/net/stop_net) => {
                let request_body: rouille::RequestBody = request.data().unwrap();
                 let start_network: NetworkInterface = serde_json::from_reader(request_body).unwrap();
-                app_cpy.clear_dns_with_primary_ip(start_network);
                 rouille::Response::json(&true)
             },
 
@@ -142,10 +139,6 @@ fn main() {
             },
 
             (POST) (/dns/set_dns_config) => {
-                let request_body: rouille::RequestBody = request.data().unwrap();
-                let dns_host: DnsHost = serde_json::from_reader(request_body).unwrap();
-                let app = app_cpy.network_module.clone();
-                app.dns_config_manager.set_host(dns_host);
                 rouille::Response::json(&true)
             },
 
@@ -195,36 +188,21 @@ fn main() {
             },
 
             (GET) (/dns/get_dns_config_list) => {
-                let dns_query = request.get_param("dns_query").unwrap_or_else(||"".to_string());
-                let app = app_cpy.network_module.clone();
-                let local_dns_server = if app.dns_config_manager.get_local_dns_state() {
-                    "127.0.0.1"
-                } else {
-                    ""
-                };
-
-                let mut bind_network_interface = app.bind_network_interface.lock().unwrap();
-                let gateway = bind_network_interface.ip_addr.clone();
-                let all_dns_host: Vec<DnsHost> = app.dns_config_manager.get_all_host_contains(dns_query);
-                rouille::Response::json(&api::GetDnsConfigResponse::new(local_dns_server.to_string(), gateway, all_dns_host))
+                let all_dns_host: Vec<DnsHost> = Vec::default();
+                rouille::Response::json(&api::GetDnsConfigResponse::new("".to_string(), "".to_string(), all_dns_host))
             },
 
             (POST) (/dns/set_dns_config) => {
-                let request_body: rouille::RequestBody = request.data().unwrap();
-                let dns_host: DnsHost = serde_json::from_reader(request_body).unwrap();
-                let app = app_cpy.network_module.clone();
-                app.dns_config_manager.set_host(dns_host);
                 rouille::Response::json(&true)
             },
 
             (GET) (/overview/network) => {
                 let app = app_cpy.network_module.clone();
                 let interfaces = app.clone().system_manager.get_network_interface().unwrap_or_else(||vec![]);
-                let network_state = app.clone().dns_config_manager.get_local_dns_state();
                 let bind_dns_interface = &app.clone().bind_network_interface.lock().unwrap().get_copy();
                 rouille::Response::json(&api::NetworkOverview{
                     interface_list: interfaces,
-                    network_state: network_state,
+                    network_state: false,
                     bind_interface: bind_dns_interface.get_copy()
                 })
             },
@@ -267,6 +245,7 @@ impl App {
         let mut network_module = self.network_module.clone();
         spawn(move || {
             let ipv4_packet_interceptor = Ipv4PacketInterceptor {
+                session_route_strategy: network_module.session_route_strategy.clone(),
                 nat_session_manager: network_module.nat_session_manager.clone(),
                 fake_ip_manager: network_module.fake_ip_manager.clone(),
                 proxy_config_manager: network_module.proxy_server_config_manager.clone(),
@@ -278,80 +257,30 @@ impl App {
             ipv4_packet_interceptor.run();
         });
     }
-
-    pub fn setup_dns(&self) {
-        log::info!("set up dns");
-        self.network_module.setup_dns();
-    }
-
-    pub fn setup_dns_with_primary_ip(&self, network_interface: NetworkInterface) {
-        let mut bind_network_interface = self.network_module.bind_network_interface.lock().unwrap();
-        bind_network_interface.ip_addr = network_interface.ip_addr.clone();
-        bind_network_interface.interface_name = network_interface.interface_name.clone();
-        log::info!("setup dns with interface {:?}", network_interface.get_copy());
-
-        let primary_ip = network_interface.interface_name;
-        if primary_ip.is_empty() {
-            self.setup_dns()
-        } else {
-            log::info!("set up dns with primary ip {}", primary_ip);
-            self.network_module.setup_dns_with_interface_name(primary_ip);
-        }
-    }
-
-    pub fn clear_dns(&self) {
-        log::info!("clear dns");
-        self.network_module.clear_dns();
-    }
-
-    pub fn clear_dns_with_primary_ip(&self, network_interface: NetworkInterface) {
-        let mut bind_network_interface = self.network_module.bind_network_interface.lock().unwrap();
-        bind_network_interface.ip_addr = "".to_string();
-        bind_network_interface.interface_name = "".to_string();
-        let primary_ip = network_interface.interface_name.to_string();
-        if primary_ip.is_empty() {
-            self.network_module.clear_dns();
-        } else {
-            log::info!("clear dns with primary ip {}", primary_ip);
-            self.network_module.clear_dns_with_interface_name(primary_ip);
-        }
-    }
-
-    pub fn clone(&self) -> App {
-        let b = self.network_module.clone();
-        App {
-            network_module: b
-        }
-    }
 }
 
 ///
 pub struct NetworkModule {
-    pub dns_listen: String,
-    pub dns_setup: DNSSetup,
     pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
     pub host_route_manager: Arc<HostRouteManager>,
+    pub session_route_strategy: Arc<DashMap<u16, HostRouteStrategy>>,
     pub fake_ip_manager: Arc<FakeIpManager>,
     pub proxy_server_config_manager: Arc<ProxyServerConfigManager>,
     pub active_connection_manager: Arc<ActiveConnectionManager>,
     pub system_manager: Arc<SystemManager>,
-    pub dns_config_manager: Arc<DnsConfigManager>,
     pub bind_network_interface: Arc<Mutex<NetworkInterface>>,
 }
 
 impl NetworkModule {
-    pub fn new(dns_listen: &str, net_session_begin_port: u16, db: Arc<core::db::Db>) -> Self {
+    pub fn new(net_session_begin_port: u16, db: Arc<core::db::Db>) -> Self {
         Self {
-            // TODO: windows
-            dns_listen: dns_listen.to_string(),
-            dns_setup: sys::sys::DNSSetup::new(dns_listen.to_string()),
             nat_session_manager: Arc::new(Mutex::new(NatSessionManager::new(net_session_begin_port))),
             host_route_manager: Arc::new(HostRouteManager::new(db.clone())),
+            session_route_strategy: Arc::new(DashMap::with_capacity(512)),
             fake_ip_manager: Arc::new(FakeIpManager::new((10, 0, 0, 100))),
             proxy_server_config_manager: Arc::new(ProxyServerConfigManager::new(db.clone())),
             active_connection_manager: Arc::new(Default::default()),
             system_manager: Arc::new(SystemManager { system: Default::default() }),
-            dns_config_manager: Arc::new(DnsConfigManager::new(db.clone())),
             bind_network_interface: Arc::new(Mutex::new(NetworkInterface { interface_name: "".to_string(), ip_addr: "".to_string()}))
         }
     }
@@ -360,35 +289,9 @@ impl NetworkModule {
         log::info!("run relay server")
     }
 
-    pub fn setup_dns(&self) {
-        log::info!("setup run dns server, listen at {}", self.dns_listen);
-        self.dns_setup.set_dns();
-        self.dns_config_manager.mark_local_dns_start();
-    }
-
-    pub fn setup_dns_with_interface_name(&self, interface_name: String) {
-        log::info!("setup run dns server, listen at {}", self.dns_listen);
-        self.dns_setup.set_dns_with_primary_interface_name(interface_name);
-        self.dns_config_manager.mark_local_dns_start();
-    }
-
-    pub fn clear_dns(&self) {
-        self.dns_setup.clear_dns();
-        self.dns_config_manager.mark_local_dns_stop();
-    }
-
-    pub fn clear_dns_with_interface_name(&self, interface_name: String) {
-        self.dns_setup.clear_dns_with_interface_name(interface_name);
-        self.dns_config_manager.mark_local_dns_stop();
-    }
-
     #[cfg(target_os = "macos")]
     pub fn set_rlimit(&self, limit: u64) {
         set_rlimit(limit);
-    }
-
-    pub fn run_dns_server(&self) {
-        log::info!("run dns server, listen at {}", self.dns_listen);
     }
 
     pub fn run(&self) {
@@ -397,10 +300,10 @@ impl NetworkModule {
         let nat_session_manager = self.nat_session_manager.clone();
         let fake_ip_manager = self.fake_ip_manager.clone();
         let host_route_manager = self.host_route_manager.clone();
+        let session_route_strategy = self.session_route_strategy.clone();
         let proxy_server_config_manager = self.proxy_server_config_manager.clone();
         let active_connection_manager = self.active_connection_manager.clone();
         let process_manager = self.system_manager.clone();
-        let dns_config_manager = self.dns_config_manager.clone();
 
         // start tun_server
         let (stared_event_sender, mut stared_event_receiver) = std::sync::mpsc::channel();
@@ -419,10 +322,10 @@ impl NetworkModule {
         self.run_async_component(nat_session_manager.clone(),
                                  fake_ip_manager.clone(),
                                  host_route_manager.clone(),
+                                 session_route_strategy.clone(),
                                  proxy_server_config_manager.clone(),
                                  active_connection_manager.clone(),
-                                 process_manager.clone(),
-                                 dns_config_manager.clone());
+                                 process_manager.clone());
     }
 
     pub fn run_sync_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>, stared_event_sender: std::sync::mpsc::Sender<bool>) {
@@ -448,10 +351,10 @@ impl NetworkModule {
     pub fn run_async_component(&self, nat_session_manager: Arc<Mutex<NatSessionManager>>,
                                fake_ip_manager: Arc<FakeIpManager>,
                                host_route_manager: Arc<HostRouteManager>,
+                               session_route_strategy: Arc<DashMap<u16, HostRouteStrategy>>,
                                proxy_server_config_manager: Arc<ProxyServerConfigManager>,
                                active_connection_manager: Arc<ActiveConnectionManager>,
-                               process_manager: Arc<SystemManager>,
-                               dns_config_manager: Arc<DnsConfigManager>) {
+                               process_manager: Arc<SystemManager>) {
 
         log::info!("run async component");
         let run_time = match tokio::runtime::Builder::new_current_thread()
@@ -469,108 +372,23 @@ impl NetworkModule {
             }
         };
         run_time.block_on(async {
-            // dns resolver
-            let resolver_config = self.default_resolver_config();
-            let resolver_opts = self.default_resolver_opts();
-            let resolver = async_std_resolver::resolver(resolver_config, resolver_opts).await.expect("failed to connect resolver");
-
-            // forward dns resolver
-            let forward_resolver_config = self.forward_resolver_config();
-            let forward_resolver_opts = self.default_resolver_opts();
-            let forward_resolver = async_std_resolver::resolver(forward_resolver_config, forward_resolver_opts).await.expect("failed to connect resolver");
-
-            // dns server
-            let dns_server = DnsManager {
-                resolver: Arc::new(resolver.clone()),
-                forward_resolver: Arc::new(forward_resolver.clone()),
-                fake_ip_manager: fake_ip_manager.clone(),
-                dns_config_manager: dns_config_manager.clone(),
-                dns_listen: "127.0.0.1:53".to_string(),
-            };
-            log::info!("start run dns sever");
-            // dns_server.run_dns_server();
-            log::info!("start run dns sever complete");
 
             // tcp_relay_server
             let tcp_relay_server = TcpRelayServer {
-                resolver: Arc::new(resolver.clone()),
                 fake_ip_manager: fake_ip_manager.clone(),
                 nat_session_manager: nat_session_manager.clone(),
                 host_route_manager: host_route_manager.clone(),
+                session_route_strategy: session_route_strategy.clone(),
                 active_connection_manager: active_connection_manager.clone(),
                 proxy_server_config_manager: proxy_server_config_manager.clone(),
                 listen_addr: (127, 0, 0, 1),
                 listen_port: 1300,
                 process_manager: process_manager.clone(),
-                dns_config_manager: dns_config_manager.clone()
             };
             log::info!("start tcp relay sever");
             tcp_relay_server.run().await;
             log::info!("start tcp relay sever complete");
         });
-    }
-
-    fn default_resolver_config(&self) -> ResolverConfig {
-        let num_concurrent_reqs = 3;
-        let mut name_server_config_group = NameServerConfigGroup::with_capacity(num_concurrent_reqs);
-        name_server_config_group.push(
-            NameServerConfig {
-                socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("114.114.114.114").unwrap(), 53)),
-                protocol: Protocol::Udp,
-                tls_dns_name: None,
-                trust_nx_responses: false,
-                bind_addr: None,
-            }
-        );
-
-        name_server_config_group.push(
-            NameServerConfig {
-                socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("223.5.5.5").unwrap(), 53)),
-                protocol: Protocol::Udp,
-                tls_dns_name: None,
-                trust_nx_responses: false,
-                bind_addr: None,
-            }
-        );
-
-        name_server_config_group.push(
-            NameServerConfig {
-                socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("114.114.114.114").unwrap(), 53)),
-                protocol: Protocol::Tcp,
-                tls_dns_name: None,
-                trust_nx_responses: false,
-                bind_addr: None,
-            }
-        );
-        return config::ResolverConfig::from_parts(None, Vec::new(), name_server_config_group);
-    }
-
-    fn forward_resolver_config(&self) -> ResolverConfig {
-
-        #[cfg(target_os="macos")]
-        let gateway_addr = get_gateway();
-
-        #[cfg(target_os="windows")]
-        let gateway_addr = "192.168.0.1".to_string();
-        let num_concurrent_reqs = 3;
-        let mut name_server_config_group = NameServerConfigGroup::with_capacity(num_concurrent_reqs);
-        name_server_config_group.push(
-            NameServerConfig {
-                socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str(gateway_addr.as_str()).unwrap(), 53)),
-                protocol: Protocol::Udp,
-                tls_dns_name: None,
-                trust_nx_responses: false,
-                bind_addr: None,
-            }
-        );
-        return config::ResolverConfig::from_parts(None, Vec::new(), name_server_config_group);
-    }
-
-    fn default_resolver_opts(&self) -> ResolverOpts {
-        let mut resolver_opts = config::ResolverOpts::default();
-        resolver_opts.timeout = Duration::from_millis(200);
-        resolver_opts.num_concurrent_reqs = 3;
-        resolver_opts
     }
 }
 

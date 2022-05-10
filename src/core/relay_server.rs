@@ -12,22 +12,23 @@ use crate::{ProxyServerConfigManager, SystemManager, ProcessInfo};
 use crate::core::active_connection_manager::{ActiveConnectionManager, ActiveConnection, ConnectionTransferType};
 use crate::core::dns_manager::DnsConfigManager;
 use std::io::Error;
+use dashmap::DashMap;
+use dashmap::mapref::one::Ref;
+use libc::exit;
 
 pub struct TcpRelayServer {
-    pub resolver: Arc<AsyncStdResolver>,
     pub fake_ip_manager: Arc<FakeIpManager>,
     pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
     pub host_route_manager: Arc<HostRouteManager>,
+    pub session_route_strategy: Arc<DashMap<u16, HostRouteStrategy>>,
     pub proxy_server_config_manager: Arc<ProxyServerConfigManager>,
     pub active_connection_manager: Arc<ActiveConnectionManager>,
     pub process_manager: Arc<SystemManager>,
-    pub dns_config_manager: Arc<DnsConfigManager>,
     pub listen_addr: (u8, u8, u8, u8),
     pub listen_port: u16,
 }
 
 impl TcpRelayServer {
-
     pub async fn run(&self) {
         self.run_session_port_recycler();
 
@@ -73,7 +74,7 @@ impl TcpRelayServer {
             Ok(nat_session_manager) => nat_session_manager,
             Err(errors) => {
                 log::error!("get nat session manager error, {}", errors);
-                return
+                return;
             }
         };
 
@@ -84,13 +85,12 @@ impl TcpRelayServer {
             }
             Some((src_addr, src_port, dst_addr, dst_port)) => {
                 log::info!("real address is {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
-                let resolver_copy = self.resolver.clone();
                 let fake_ip_manager = self.fake_ip_manager.clone();
                 let host_route_manager = self.host_route_manager.clone();
+                let session_route_strategy = self.session_route_strategy.clone();
                 let proxy_server_config_manager = self.proxy_server_config_manager.clone();
                 let active_connection_manager = self.active_connection_manager.clone();
                 let mut process_manager = self.process_manager.clone();
-                let dns_config_manager = self.dns_config_manager.clone();
 
                 tokio::spawn(async move {
                     let dst_addr_bytes = dst_addr.octets();
@@ -98,28 +98,21 @@ impl TcpRelayServer {
                     let origin_host_port = match fake_ip_manager.get_host(&fake_ip) {
                         None => {
                             log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                            return
+                            return;
                         }
 
                         Some(host) => (host, dst_port)
                     };
-
-                    let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
-                        let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
-                        let process_info = process_manager.get_process(pid)
-                            .unwrap_or_else(|| ProcessInfo::default());
-                        Some(ProcessInfo::default())
-                    } else {
-                        Some(ProcessInfo::default())
-                    }.unwrap();
-                    let (rule_strategy, _) = match host_route_manager.get_host_route_strategy(Some(&process_info), &origin_host_port.0) {
-                        None => (HostRouteStrategy::Direct, ConnectionRouteRule::new()),
-                        Some(strategy) => strategy
+                    let session_route_strategy = match session_route_strategy.get(&session_port) {
+                        None => {
+                            return;
+                        }
+                        Some(rule_strategy) => {
+                            rule_strategy.value().get_copy()
+                        }
                     };
-                    match rule_strategy {
+                    match session_route_strategy {
                         HostRouteStrategy::Proxy(proxy_config_name, direct_ip, last_update_time) => {
-                            // host_route_manager
-                            // TODO: dns_lookup cache.
                             let (addr, port) = match proxy_server_config_manager.get_proxy_server_config(proxy_config_name.as_str()) {
                                 None => {
                                     log::error!("get proxy server {} error", proxy_config_name);
@@ -130,25 +123,22 @@ impl TcpRelayServer {
                                         ProxyServerConfigType::SocksV5(addr, port, _, _) => {
                                             (addr, port)
                                         }
-                                       _ => {
-                                           return;
-                                       }
+                                        _ => {
+                                            return;
+                                        }
                                     }
                                 }
                             };
-                            let (proxy_direct_ip, proxy_port) = match TcpRelayServer::resolve_host_ip(resolver_copy, &addr, port).await {
-                                None => {
-                                    return
-                                },
-                                Some((ip, port)) => (ip, port)
-                            };
-
+                            let (proxy_direct_ip, proxy_port) = (addr, port);
                             let target_addr = format!("{}:{}", origin_host_port.0, origin_host_port.1);
-                            let mut proxy_socket = tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await.unwrap();
-                            // TODO: add connection
-
-                            // TcpRelayServer::add_active_connection(session_port, src_addr, src_port, dst_port, &active_connection_manager, connection_route_rule, Some(process_info.get_copy()), &origin_host_port);
-                            let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(),4096, tcp_socket, proxy_socket);
+                            let mut proxy_socket = match tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await {
+                                Ok(stream) => stream,
+                                Err(errors) => {
+                                    log::error!("Connect socks5 proxy {}:{} error, {}", proxy_direct_ip.as_str(), proxy_port, errors);
+                                    return;
+                                }
+                            };
+                            let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), 4096, tcp_socket, proxy_socket);
                             stream_pipe.pipe_loop().await
                         }
                         _ => {
@@ -166,12 +156,11 @@ impl TcpRelayServer {
                                         transfer_type: ConnectionTransferType,
                                         process_info: Option<ProcessInfo>,
                                         origin_host_port: &(String, u16)) {
-
         let process_info = process_info
             .unwrap_or_else(|| ProcessInfo {
                 pid: 0,
                 process_name: "".to_string(),
-                process_execute_path: "".to_string()
+                process_execute_path: "".to_string(),
             });
         active_connection_manager.add_connection(ActiveConnection {
             pid: process_info.pid,
@@ -190,7 +179,7 @@ impl TcpRelayServer {
             latest_touch_timestamp: NatSessionManager::get_now_time(),
             pre_tx: 0,
             pre_rx: 0,
-            pre_touch_timestamp: 0
+            pre_touch_timestamp: 0,
         });
     }
 
@@ -218,7 +207,6 @@ impl TcpRelayServer {
     async fn resolve_direct_ip_port(dst_addr: Ipv4Addr, dst_port: u16,
                                     resolver: Arc<AsyncStdResolver>,
                                     fake_ip_manager: Arc<FakeIpManager>) -> Option<(String, u16)> {
-
         let dst_addr_bytes = dst_addr.octets();
         let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
         let direct_address_port = match fake_ip_manager.get_host(&fake_ip) {
