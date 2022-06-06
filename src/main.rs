@@ -528,7 +528,7 @@ impl SystemManager {
                     if process.cmd().len() > 0 {
                         process.cmd()[0].to_string()
                     } else {
-                        "".to_string()
+                        process.name().to_string()
                     }
                 };
 

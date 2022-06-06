@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, LinkedList};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use crate::dns::resolve::FakeIpManager;
@@ -13,7 +13,7 @@ use dns_parser::RData;
 use smoltcp::wire::{IpProtocol, UdpPacket, TcpPacket, Ipv4Packet};
 use smoltcp::Error;
 use dns_parser::rdata::A;
-use log::info;
+use libc::sockaddr;
 use rouille::url::quirks::host;
 use windivert::address::WinDivertNetworkData;
 use crate::{ActiveConnectionManager, HostRouteManager, HostRouteStrategy, NatSessionManager, ProcessInfo, ProxyServerConfigManager, ProxyServerConfigType, SystemManager, TcpRelayServer};
@@ -21,7 +21,8 @@ use crate::core::active_connection_manager::ConnectionTransferType;
 use crate::core::proxy_config_manager::{ConnectionRouteRule, RouteRule};
 
 const UDP_BUFFER_SIZE: usize = 64 * 1024;
-const TCP_BUFFER_SIZE: usize = 16 * 1024;
+const TCP_BUFFER_SIZE: usize = 64 * 1024;
+const MAX_BUFFER_COUNT: usize = 32;
 
 pub struct Ipv4PacketInterceptor {
     pub session_route_strategy: Arc<DashMap<u16, HostRouteStrategy>>,
@@ -52,6 +53,7 @@ impl Ipv4PacketInterceptor {
             }
         });
 
+        // buffer pool
         let local_host_ip_addr_octets = Ipv4Addr::from_str("127.0.0.1").unwrap().octets();
         let relay_server_port = 13000u16;
         let filter = "ip";
@@ -68,11 +70,18 @@ impl Ipv4PacketInterceptor {
 
         // start worker pool
         let worker_num = self.process_manager.get_available_processor_num() * 2;
-        let mut worker_mpsc: HashMap<usize, SyncSender<(WinDivertNetworkData, Ipv4Packet<Vec<u8>>)>> = HashMap::with_capacity(worker_num);
+        let buffer_pool = Arc::new(crossbeam::queue::ArrayQueue::new(worker_num * MAX_BUFFER_COUNT));
+        let mut worker_mpsc: HashMap<usize, crossbeam::channel::Sender<(WinDivertNetworkData, Ipv4Packet<Vec<u8>>)>> = HashMap::with_capacity(worker_num);
         for worker_id in 0..worker_num {
             // mpsc
-            let (tx, rx) = sync_channel(256);
+            let (tx, rx) = crossbeam::channel::bounded(MAX_BUFFER_COUNT);
             worker_mpsc.insert(worker_id, tx);
+
+            // buffer pool
+            let buffer_pool = buffer_pool.clone();
+            let mut recycle_buffer_handler = move |buffer: Vec<u8>| {
+                buffer_pool.push(buffer);
+            };
 
             // start thread
             let handle = handle_arc.clone();
@@ -88,7 +97,6 @@ impl Ipv4PacketInterceptor {
                 let dummy_proxy = HostRouteStrategy::Proxy(String::from(""), None, 0);
                 let mut proxy_server_host_set: HashSet<String> = HashSet::with_capacity(16);
                 let mut host_route_strategy_map: HashMap<u16, (HostRouteStrategy, ProcessInfo)> = HashMap::with_capacity(512);
-                let mut host_route_strategy_map: HashMap<u16, (HostRouteStrategy, ProcessInfo)> = HashMap::with_capacity(512);
                 loop {
                     match rx.recv() {
                         Ok((addr, mut ipv4_packet)) => {
@@ -102,7 +110,8 @@ impl Ipv4PacketInterceptor {
                                         Ok(udp_packet) => udp_packet,
                                         Err(errors) => {
                                             log::error!("create udp packet error, {}", errors.to_string());
-                                            // handle.send(WinDivertParsedPacket::Network { addr, data });
+                                            let data = ipv4_packet.into_inner();
+                                            recycle_buffer_handler(data);
                                             continue;
                                         }
                                     };
@@ -114,8 +123,9 @@ impl Ipv4PacketInterceptor {
                                         let fake_ip_manager = fake_ip_manager.clone();
                                         let host = match fake_ip_manager.get_host(&(dst_addr_octets[0], dst_addr_octets[1], dst_addr_octets[2], dst_addr_octets[3])) {
                                             None => {
-                                                let data = ipv4_packet.into_inner();
-                                                handle.send(WinDivertParsedPacket::Network { addr, data });
+                                                let mut data = ipv4_packet.into_inner();
+                                                handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                                recycle_buffer_handler(data);
                                                 continue;
                                             }
                                             Some(host) => host
@@ -147,16 +157,19 @@ impl Ipv4PacketInterceptor {
                                             );
                                         }
 
-                                        let data = ipv4_packet.into_inner();
+                                        let mut data = ipv4_packet.into_inner();
                                         connection_manager.incr_tx(src_port, data.len());
-                                        handle.send(WinDivertParsedPacket::Network { addr, data });
+                                        // handle.send(WinDivertParsedPacket::Network { addr, data });
+                                        handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                        recycle_buffer_handler(data);
                                         continue;
                                     } else {
                                         // inbound
                                         if udp_packet.src_port() != 53 {
-                                            let data = ipv4_packet.into_inner();
+                                            let mut data = ipv4_packet.into_inner();
                                             connection_manager.incr_rx(src_port, data.len());
-                                            handle.send(WinDivertParsedPacket::Network { addr, data });
+                                            handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                            recycle_buffer_handler(data);
                                             continue;
                                         }
 
@@ -166,22 +179,25 @@ impl Ipv4PacketInterceptor {
                                             Ok(dns_packet) => dns_packet,
                                             Err(errors) => {
                                                 log::error!("parse dns udp packet error, {}", errors.to_string());
-                                                let data = ipv4_packet.into_inner();
-                                                handle.send(WinDivertParsedPacket::Network { addr, data });
+                                                let mut data = ipv4_packet.into_inner();
+                                                handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                                recycle_buffer_handler(data);
                                                 continue;
                                             }
                                         };
 
                                         if dns_packet.header.query {
                                             log::warn!("parse dns query udp packet");
-                                            let data = ipv4_packet.into_inner();
-                                            handle.send(WinDivertParsedPacket::Network { addr, data });
+                                            let mut data = ipv4_packet.into_inner();
+                                            handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                            recycle_buffer_handler(data);
                                             continue;
                                         }
 
                                         update_fake_ip_dns(fake_ip_manager.clone(), dns_packet);
-                                        let data = ipv4_packet.into_inner();
-                                        handle.send(WinDivertParsedPacket::Network { addr, data });
+                                        let mut data = ipv4_packet.into_inner();
+                                        handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                        recycle_buffer_handler(data);
                                     }
                                 }
 
@@ -191,8 +207,9 @@ impl Ipv4PacketInterceptor {
                                         Ok(tcp_packet) => tcp_packet,
                                         Err(errors) => {
                                             log::error!("create tcp packet error, {}", errors.to_string());
-                                            let data = ipv4_packet.into_inner();
-                                            handle.send(WinDivertParsedPacket::Network { addr, data });
+                                            let mut data = ipv4_packet.into_inner();
+                                            handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                            recycle_buffer_handler(data);
                                             continue;
                                         }
                                     };
@@ -204,8 +221,9 @@ impl Ipv4PacketInterceptor {
 
                                     if outbound {
                                         if dst_addr_octets == local_host_ip_addr_octets {
-                                            let data = ipv4_packet.into_inner();
-                                            handle.send(WinDivertParsedPacket::Network { addr, data });
+                                            let mut data = ipv4_packet.into_inner();
+                                            handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                            recycle_buffer_handler(data);
                                             continue;
                                         }
 
@@ -217,14 +235,16 @@ impl Ipv4PacketInterceptor {
                                         };
 
                                         if proxy_server_host_set.contains(&host) {
-                                            let data = ipv4_packet.into_inner();
-                                            handle.send(WinDivertParsedPacket::Network { addr, data });
+                                            let mut data = ipv4_packet.into_inner();
+                                            handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                            recycle_buffer_handler(data);
                                             continue;
                                         }
 
                                         // let seq_number = tcp_packet.seq_number();
                                         if tcp_packet.syn() {
                                             if src_port != relay_server_port {
+                                                // log::info!("------- new tcp pipe {} -> {}:{} -> {}:{} -> seq_num {}", &host, src_addr, src_port, dst_addr, dst_port, seq_number);
                                                 if let Some(proxy_server_config_vec) = proxy_config_manager.get_all_proxy_server_config() {
                                                     for proxy_server_config in proxy_server_config_vec {
                                                         match proxy_server_config.config {
@@ -235,11 +255,9 @@ impl Ipv4PacketInterceptor {
                                                         }
                                                     }
                                                 }
-                                                // log::info!("------- new tcp pipe {} -> {}:{} -> {}:{} -> seq_num {}", &host, src_addr, src_port, dst_addr, dst_port, seq_number);
                                                 let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
                                                     let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
-                                                    let process_info = process_manager.get_process(pid)
-                                                        .unwrap_or_else(|| ProcessInfo::default());
+                                                    let process_info = process_manager.get_process(pid).unwrap_or_else(|| ProcessInfo::default());
                                                     Some(process_info)
                                                 } else {
                                                     Some(ProcessInfo::default())
@@ -262,7 +280,7 @@ impl Ipv4PacketInterceptor {
                                         } else if tcp_packet.fin() {
                                             if src_port != relay_server_port {
                                                 // log::info!("======= close tcp pipe {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
-                                                connection_manager.remove_connection(src_port);
+                                                // connection_manager.remove_connection(src_port);
                                             }
                                         }
 
@@ -285,12 +303,14 @@ impl Ipv4PacketInterceptor {
                                             HostRouteStrategy::Reject => {
                                                 let data = ipv4_packet.into_inner();
                                                 connection_manager.incr_tx(src_port, data.len());
+                                                recycle_buffer_handler(data);
                                                 continue;
                                             }
                                             _ => {
-                                                let data = ipv4_packet.into_inner();
+                                                let mut data = ipv4_packet.into_inner();
                                                 connection_manager.incr_tx(src_port, data.len());
-                                                handle.send(WinDivertParsedPacket::Network { addr, data });
+                                                handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                                recycle_buffer_handler(data);
                                                 continue;
                                             }
                                         }
@@ -300,8 +320,9 @@ impl Ipv4PacketInterceptor {
                                             let mut nat_session_manager = nat_session_manager.lock().unwrap();
                                             let (origin_src_addr, origin_src_port, origin_dst_addr, origin_dst_port) = match nat_session_manager.get_port_session_tuple(dst_port) {
                                                 None => {
-                                                    let data = ipv4_packet.into_inner();
-                                                    handle.send(WinDivertParsedPacket::Network { addr, data });
+                                                    let mut data = ipv4_packet.into_inner();
+                                                    handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                                    recycle_buffer_handler(data);
                                                     continue;
                                                 }
                                                 Some((origin_src_addr, origin_src_port, origin_dst_addr, origin_dst_port)) => {
@@ -322,9 +343,10 @@ impl Ipv4PacketInterceptor {
                                             ipv4_packet.set_dst_addr(new_dst_addr.into());
                                             ipv4_packet.fill_checksum();
                                             // log::info!("Relay server Send new >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> {}:{} -> {}:{} / origin {}:{} -> {}:{} -> seq {}", new_src_addr, new_src_port, new_dst_addr, new_dst_port, src_addr, src_port, dst_addr, dst_port, seq_number);
-                                            let data = ipv4_packet.into_inner();
+                                            let mut data = ipv4_packet.into_inner();
                                             connection_manager.incr_rx(new_dst_port, data.len());
-                                            handle.send(WinDivertParsedPacket::Network { addr, data });
+                                            handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                            recycle_buffer_handler(data);
                                             continue;
                                         } else {
                                             // modify tcp packet
@@ -336,15 +358,17 @@ impl Ipv4PacketInterceptor {
 
                                                 Err(errors) => {
                                                     log::error!("get nat session manager lock error");
-                                                    let data = ipv4_packet.into_inner();
-                                                    handle.send(WinDivertParsedPacket::Network { addr, data });
+                                                    let mut data = ipv4_packet.into_inner();
+                                                    handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                                    recycle_buffer_handler(data);
                                                     continue;
                                                 }
                                             };
                                             let port = match nat_session_manager.get_session_port((src_addr, src_port, dst_addr, dst_port)) {
                                                 None => {
-                                                    let data = ipv4_packet.into_inner();
-                                                    handle.send(WinDivertParsedPacket::Network { addr, data });
+                                                    let mut data = ipv4_packet.into_inner();
+                                                    handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                                    recycle_buffer_handler(data);
                                                     continue;
                                                 }
                                                 Some(port) => port
@@ -366,22 +390,25 @@ impl Ipv4PacketInterceptor {
                                             ipv4_packet.set_src_addr(new_src_addr.into());
                                             ipv4_packet.set_dst_addr(new_dst_addr.into());
                                             ipv4_packet.fill_checksum();
-                                            let data = ipv4_packet.into_inner();
+                                            let mut data = ipv4_packet.into_inner();
                                             connection_manager.incr_tx(src_port, data.len());
-                                            handle.send(WinDivertParsedPacket::Network { addr, data });
+                                            handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                            recycle_buffer_handler(data);
                                             continue;
                                         }
                                     } else {
-                                        let data = ipv4_packet.into_inner();
+                                        let mut data = ipv4_packet.into_inner();
                                         connection_manager.incr_rx(dst_port, data.len());
-                                        handle.send(WinDivertParsedPacket::Network { addr, data });
+                                        handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                        recycle_buffer_handler(data);
                                         continue;
                                     }
                                 }
 
                                 _ => {
-                                    let data = ipv4_packet.into_inner();
-                                    handle.send(WinDivertParsedPacket::Network { addr, data });
+                                    let mut data = ipv4_packet.into_inner();
+                                    handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                    recycle_buffer_handler(data);
                                 }
                             }
                         }
@@ -397,11 +424,24 @@ impl Ipv4PacketInterceptor {
         // start recv windivert packet
         let handle = handle_arc.clone();
         loop {
-            match handle.recv(UDP_BUFFER_SIZE) {
-                Ok(windivert_packet) => {
+            let mut buffer = match buffer_pool.pop() {
+                None => {
+                    let mut buffer = Vec::with_capacity(UDP_BUFFER_SIZE);
+                    unsafe { buffer.set_len(UDP_BUFFER_SIZE); }
+                    buffer
+                }
+                Some(mut buffer) => {
+                    unsafe { buffer.set_len(UDP_BUFFER_SIZE); }
+                    buffer
+                }
+            };
+
+            match handle.recv_with_buffer(buffer) {
+                Ok((packet_len, windivert_packet)) => {
                     let windivert_parsed_packet = windivert_packet.parse();
                     let (src_port, addr, ipv4_packet) = match windivert_parsed_packet {
-                        WinDivertParsedPacket::Network { addr, data } => {
+                        WinDivertParsedPacket::Network { addr, mut data } => {
+                            // log::info!("Recv with buffer vec len = {}, cap = {}", packet_len, data.capacity());
                             let mut ipv4_packet = match Ipv4Packet::new_checked(data) {
                                 Ok(p) => p,
                                 Err(errors) => {
@@ -451,7 +491,7 @@ impl Ipv4PacketInterceptor {
                 }
                 Err(errors) => {
                     log::error!("Recv windivert packet errors, {}", errors.to_string());
-                    return;
+                    continue
                 }
             }
         }

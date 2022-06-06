@@ -97,8 +97,7 @@ impl TcpRelayServer {
                     let fake_ip = (dst_addr_bytes[0], dst_addr_bytes[1], dst_addr_bytes[2], dst_addr_bytes[3]);
                     let origin_host_port = match fake_ip_manager.get_host(&fake_ip) {
                         None => {
-                            log::error!("get host from fake_ip {} error", dst_addr.to_string());
-                            return;
+                            (dst_addr.to_string(), dst_port)
                         }
 
                         Some(host) => (host, dst_port)

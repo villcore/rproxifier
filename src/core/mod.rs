@@ -48,7 +48,6 @@ impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRe
                 };
 
                 if size <= 0 {
-                    log::info!("**********dst write close");
                     break;
                 }
 
@@ -68,7 +67,6 @@ impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRe
                 };
 
                 if size <= 0 {
-                    log::info!("**********src write close");
                     break;
                 }
                 self.active_connection_manager.incr_rx(self.session_port, size);
