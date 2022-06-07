@@ -19,6 +19,7 @@ pub struct StreamPipe<S, D> where S: AsyncRead + AsyncWrite, D: AsyncRead + Asyn
     pub session_port: u16,
     pub active_connection_manager: Arc<ActiveConnectionManager>,
     pub buf_size: usize,
+    buffer_pool: Arc<crossbeam::queue::ArrayQueue<(BytesMut, BytesMut)>>,
     pub src_stream: S,
     pub dst_stream: D,
 }
@@ -28,14 +29,17 @@ impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRe
     pub fn new(session_port: u16,
                active_connection_manager: Arc<ActiveConnectionManager>,
                buf_size: usize,
+               buffer_pool: Arc<crossbeam::queue::ArrayQueue<(BytesMut, BytesMut)>>,
                src_stream: S,
                dst_stream: D) -> Self {
-        StreamPipe { session_port, active_connection_manager, buf_size, src_stream, dst_stream }
+        StreamPipe { session_port, active_connection_manager, buf_size, buffer_pool, src_stream, dst_stream }
     }
 
     pub async fn pipe_loop(&mut self) {
-        let mut src_to_dst_buf = BytesMut::with_capacity(self.buf_size);
-        let mut dst_to_src_buf = BytesMut::with_capacity(self.buf_size);
+        let (mut src_to_dst_buf, mut dst_to_src_buf) = match self.buffer_pool.pop() {
+            None => (BytesMut::with_capacity(self.buf_size), BytesMut::with_capacity(self.buf_size)),
+            Some((mut src_to_dst_buf, mut dst_to_src_buf)) => (src_to_dst_buf, dst_to_src_buf)
+        };
 
         loop {
             tokio::select! {
@@ -74,5 +78,9 @@ impl <S, D> StreamPipe<S, D> where S: AsyncRead + AsyncWrite + Unpin, D: AsyncRe
               }
             }
         }
+
+        src_to_dst_buf.clear();
+        dst_to_src_buf.clear();
+        self.buffer_pool.push((src_to_dst_buf, dst_to_src_buf));
     }
 }

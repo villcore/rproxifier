@@ -12,9 +12,13 @@ use crate::{ProxyServerConfigManager, SystemManager, ProcessInfo};
 use crate::core::active_connection_manager::{ActiveConnectionManager, ActiveConnection, ConnectionTransferType};
 use crate::core::dns_manager::DnsConfigManager;
 use std::io::Error;
+use bytes::BytesMut;
 use dashmap::DashMap;
 use dashmap::mapref::one::Ref;
 use libc::exit;
+
+pub const TCP_RELAY_SERVER_BUFFER_POOL_SIZE: usize = 256;
+pub const TCP_RELAY_SOCKET_BUFFER_SIZE: usize = 4 * 1024;
 
 pub struct TcpRelayServer {
     pub fake_ip_manager: Arc<FakeIpManager>,
@@ -62,13 +66,15 @@ impl TcpRelayServer {
             }
         };
 
+        let buffer_pool = Arc::new(crossbeam::queue::ArrayQueue::new(TCP_RELAY_SERVER_BUFFER_POOL_SIZE));
         log::info!("tun tcp relay server listen on {}:{}", listen_addr.0, listen_addr.1);
         while let Ok((mut tcp_socket, socket_addr)) = tcp_listener.accept().await {
-            self.accept_socket(tcp_socket, socket_addr).await;
+            let buffer_pool = buffer_pool.clone();
+            self.accept_socket(tcp_socket, socket_addr, buffer_pool).await;
         }
     }
 
-    async fn accept_socket(&self, mut tcp_socket: TcpStream, socket_addr: SocketAddr) {
+    async fn accept_socket(&self, mut tcp_socket: TcpStream, socket_addr: SocketAddr, buffer_pool: Arc<crossbeam::queue::ArrayQueue<(BytesMut, BytesMut)>>) {
         log::info!("tun tcp relay server accept relay src socket {} ", socket_addr.to_string());
         let mut nat_session_manager = match self.nat_session_manager.lock() {
             Ok(nat_session_manager) => nat_session_manager,
@@ -110,7 +116,26 @@ impl TcpRelayServer {
                             rule_strategy.value().get_copy()
                         }
                     };
+
+                    log::info!("Get session route strategy {:?} for session_port {}", &session_route_strategy, session_port);
                     match session_route_strategy {
+                        HostRouteStrategy::Direct => {
+                            let (host, port) = (dst_addr, dst_port);
+                            let mut dst_socket = match TcpStream::connect((host.to_string(), port)).await {
+                                Ok(dst_socket) => {
+                                    log::info!("session {} => connect real_addr {}:{}", session_port, &host, port);
+                                    dst_socket
+                                }
+                                Err(errors) => {
+                                    log::error!("session {} => connect real addr {}:{} error, {}", session_port, &host, port, errors);
+                                    return;
+                                }
+                            };
+
+                            let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), TCP_RELAY_SOCKET_BUFFER_SIZE, buffer_pool, tcp_socket, dst_socket);
+                            stream_pipe.pipe_loop().await;
+                        }
+
                         HostRouteStrategy::Proxy(proxy_config_name, direct_ip, last_update_time) => {
                             let (addr, port) = match proxy_server_config_manager.get_proxy_server_config(proxy_config_name.as_str()) {
                                 None => {
@@ -137,11 +162,79 @@ impl TcpRelayServer {
                                     return;
                                 }
                             };
-                            let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), 4096, tcp_socket, proxy_socket);
+                            let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), TCP_RELAY_SOCKET_BUFFER_SIZE, buffer_pool, tcp_socket, proxy_socket);
                             stream_pipe.pipe_loop().await
                         }
-                        _ => {
-                            return;
+
+                        HostRouteStrategy::Probe(already_checked, need_proxy, proxy_config_name, direct_ip, last_update_time) => {
+                            let mut need_proxy = need_proxy;
+                            let (dst_socket, direct_connected) = if !already_checked {
+                                let (direct_address, direct_port)= (dst_addr.to_string(), dst_port);
+                                log::info!("Try probe connect to {}:{}", &direct_address, direct_port);
+                                let (dst_socket, direct_connected) = match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(3)).await {
+                                    Ok(mut dst_socket) => {
+                                        log::info!("Try probe connect succeed");
+                                        (Some(dst_socket), true)
+                                    },
+                                    Err(errors) => {
+                                        log::error!("Try probe connect error, {}", errors);
+                                        (None, false)
+                                    },
+                                };
+                                host_route_manager.mark_probe_host_need_proxy(&origin_host_port.0, !direct_connected);
+                                (dst_socket, direct_connected)
+                            } else {
+                                // need proxy already checked
+                                if need_proxy {
+                                    (None, false)
+                                } else {
+                                    let (direct_address, direct_port)= (dst_addr.to_string(), dst_port);
+                                    log::info!("connect to {}:{}", direct_address, direct_port);
+                                    match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(3)).await {
+                                        Ok(mut dst_socket) => {
+                                            (Some(dst_socket), true)
+                                        },
+                                        Err(errors) => {
+                                            // log::error!("Connect to {}:{} failed, {}", direct_address, direct_port, errors);
+                                            return;
+                                        }
+                                    }
+                                }
+                            };
+
+                            if direct_connected {
+                                let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), TCP_RELAY_SOCKET_BUFFER_SIZE, buffer_pool, tcp_socket, dst_socket.unwrap());
+                                stream_pipe.pipe_loop().await
+                            } else {
+                                let (addr, port) = match proxy_server_config_manager.get_proxy_server_config(proxy_config_name.as_str()) {
+                                    None => {
+                                        log::error!("get proxy server {} error", proxy_config_name);
+                                        return;
+                                    }
+                                    Some(proxy_config) => {
+                                        match proxy_config.config {
+                                            ProxyServerConfigType::SocksV5(addr, port, _, _) => {
+                                                (addr, port)
+                                            }
+                                            _ => {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                };
+                                // proxy
+                                let (proxy_direct_ip, proxy_port) =  (addr.to_string(), port);
+                                let target_addr = format!("{}:{}", origin_host_port.0, origin_host_port.1);
+                                let mut proxy_socket = tokio_socks::tcp::Socks5Stream::connect((proxy_direct_ip.as_str(), proxy_port), target_addr).await.unwrap();
+                                // TODO: add connection
+
+                                let mut stream_pipe = StreamPipe::new(session_port, active_connection_manager.clone(), TCP_RELAY_SOCKET_BUFFER_SIZE, buffer_pool, tcp_socket, proxy_socket);
+                                stream_pipe.pipe_loop().await
+                            }
+                        }
+
+                        HostRouteStrategy::Reject => {
+                            log::info!("reject connection to {}:{}", origin_host_port.0, origin_host_port.1)
                         }
                     }
                 });
@@ -183,7 +276,6 @@ impl TcpRelayServer {
     }
 
     pub async fn connect_with_timeout<A: tokio::net::ToSocketAddrs>(addr: A, timeout_sec: Duration) -> anyhow::Result<TcpStream> {
-        let timeout_sec = Duration::from_secs(5);
         let connected_socket = tokio::select! {
             connected_socket = TcpStream::connect(addr) => {
                 match connected_socket {
@@ -246,5 +338,44 @@ impl TcpRelayServer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub mod tests{
+    use std::future::Future;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+    use icmp_socket::IcmpSocket4;
+    use crate::{setup_log, TcpRelayServer};
+
+    #[test]
+    pub fn test_connect_with_timeout() {
+        setup_log();
+        let run_time = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .worker_threads(2)
+            .max_blocking_threads(4)
+            .build() {
+
+            Ok(run_time) => {
+                run_time
+            }
+            Err(errors) => {
+                log::error!("create runtime error, {}", errors);
+                return;
+            }
+        };
+        run_time.block_on(async {
+            log::info!("a");
+            let a = TcpRelayServer::connect_with_timeout(("static.xx.fbcdn.net", 443), Duration::from_secs(3)).await.unwrap();
+            log::info!("connect result = {:?}", a);
+            log::info!("b")
+        });
+    }
+
+    #[test]
+    pub fn test_pinger() {
+        setup_log();
     }
 }

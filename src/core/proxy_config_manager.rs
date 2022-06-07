@@ -79,7 +79,7 @@ pub enum HostRouteStrategy {
     // Proxy(proxy_name direct_proxy_server_ip, last_update_time)
     Proxy(String, Option<Ipv4Addr>, u64),
 
-    // Probe(tested, need_proxy, proxy_name, proxy_server_direct_ip, last_update_time)
+    // Probe(already_checked, need_proxy, proxy_name, proxy_server_direct_ip, last_update_time)
     Probe(bool, bool, String, Option<Ipv4Addr>, u64),
 
     Reject,

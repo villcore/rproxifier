@@ -30,7 +30,7 @@ impl HostRouteManager {
     }
 
     pub fn get_host_route_strategy(&self, process_info: Option<&ProcessInfo>, host: &str) -> Option<(HostRouteStrategy, ConnectionRouteRule)> {
-        let need_proxy = self.is_probe_host_need_proxy(host);
+        let (need_proxy, proxy_check_expired) = self.is_probe_host_need_proxy(host);
         if let Some(process_info) = process_info {
             // process
             let process_path = process_info.process_execute_path.as_str();
@@ -73,23 +73,13 @@ impl HostRouteManager {
                                             }));
                                         }
                                         RouteRule::Probe(proxy_config) => {
-                                            return if need_proxy {
-                                                Some((HostRouteStrategy::Probe(false, true, proxy_config.clone(), None, 0), ConnectionRouteRule {
-                                                    hit_global_rule: false,
-                                                    hit_process_rule: true,
-                                                    host_regex: process_route_rule.host_regex.to_string(),
-                                                    need_proxy,
-                                                    route_rule: RouteRule::Probe(proxy_config)
-                                                }))
-                                            } else {
-                                                Some((HostRouteStrategy::Probe(true, false, proxy_config.clone(), None, 0), ConnectionRouteRule{
-                                                    hit_global_rule: false,
-                                                    hit_process_rule: true,
-                                                    host_regex: process_route_rule.host_regex.to_string(),
-                                                    need_proxy,
-                                                    route_rule: RouteRule::Probe(proxy_config)
-                                                }))
-                                            }
+                                            return Some((HostRouteStrategy::Probe(!proxy_check_expired, need_proxy, proxy_config.clone(), None, 0), ConnectionRouteRule{
+                                                hit_global_rule: false,
+                                                hit_process_rule: true,
+                                                host_regex: process_route_rule.host_regex.to_string(),
+                                                need_proxy,
+                                                route_rule: RouteRule::Probe(proxy_config)
+                                            }))
                                         }
                                         RouteRule::Reject => return Some((HostRouteStrategy::Reject, ConnectionRouteRule {
                                             hit_global_rule: false,
@@ -154,23 +144,13 @@ impl HostRouteManager {
                             }))
                         }
                         RouteRule::Probe(proxy_config) => {
-                            return if need_proxy {
-                                Some((HostRouteStrategy::Probe(false, true, proxy_config.clone(), None, 0), ConnectionRouteRule {
+                            return Some((HostRouteStrategy::Probe(!proxy_check_expired, need_proxy, proxy_config.clone(), None, 0), ConnectionRouteRule {
                                     hit_global_rule: true,
                                     hit_process_rule: false,
                                     host_regex: route_rule.host_regex.to_string(),
                                     need_proxy,
                                     route_rule: RouteRule::Probe(proxy_config)
                                 }))
-                            } else {
-                                Some((HostRouteStrategy::Probe(true, false, proxy_config.clone(), None, 0), ConnectionRouteRule {
-                                    hit_global_rule: true,
-                                    hit_process_rule: false,
-                                    host_regex: route_rule.host_regex.to_string(),
-                                    need_proxy,
-                                    route_rule: RouteRule::Probe(proxy_config)
-                                }))
-                            }
                         }
                         RouteRule::Reject => return Some((HostRouteStrategy::Reject, ConnectionRouteRule {
                             hit_global_rule: true,
@@ -222,20 +202,18 @@ impl HostRouteManager {
         };
     }
 
-    pub fn mark_probe_host_need_proxy(&self, host: &str) {
-        self.probe_proxy_host.insert(host.to_string(), (true, NatSessionManager::get_now_time()));
+    pub fn mark_probe_host_need_proxy(&self, host: &str, need_proxy: bool) {
+        self.probe_proxy_host.insert(host.to_string(), (need_proxy, NatSessionManager::get_now_time()));
     }
 
-    pub fn is_probe_host_need_proxy(&self, host: &str) -> bool {
-       if let Some(kv) = self.probe_proxy_host.get(host) {
-          let (need_proxy, last_update_timestamp) = kv.value();
-           if NatSessionManager::get_now_time() - last_update_timestamp > 10 * 60 {
-               return false
-           }
-           *need_proxy
-       } else {
-           false
-       }
+    pub fn is_probe_host_need_proxy(&self, host: &str) -> (bool, bool) {
+        return if let Some(kv) = self.probe_proxy_host.get(host) {
+            let (need_proxy, last_update_timestamp) = kv.value();
+            let proxy_check_expired = NatSessionManager::get_now_time() - last_update_timestamp > 30 * 60;
+            (*need_proxy, proxy_check_expired)
+        } else {
+            (false, true)
+        }
     }
 
     pub fn add_global_route_rule(&self, regex_route_rule: RegexRouteRule) {
