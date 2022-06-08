@@ -498,6 +498,9 @@ impl Ipv4PacketInterceptor {
                                     (src_port, addr, ipv4_packet)
                                 }
                                 _ => {
+                                    let mut data = ipv4_packet.into_inner();
+                                    handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                    buffer_pool.push(data);
                                     continue;
                                 }
                             }
