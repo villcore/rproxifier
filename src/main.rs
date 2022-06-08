@@ -359,8 +359,10 @@ impl NetworkModule {
         log::info!("run async component");
         let run_time = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .worker_threads(process_manager.get_available_processor_num())
-            .max_blocking_threads(process_manager.get_available_processor_num() * 2)
+            // .worker_threads(process_manager.get_available_processor_num())
+            // .max_blocking_threads(process_manager.get_available_processor_num() * 2)
+            .worker_threads(1)
+            .max_blocking_threads(1)
             .build() {
 
             Ok(run_time) => {
