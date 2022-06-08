@@ -42,6 +42,10 @@ impl Ipv4PacketInterceptor {
         let process_manager = self.process_manager.clone();
         std::thread::spawn(move || {
             loop {
+                // add connection
+                // remove connection
+                // incr connection data
+                // kick out
                 if let Some(connection_vec) = connection_manager.get_all_connection() {
                     for active_connection in connection_vec {
                         let src_port = active_connection.src_port;
@@ -70,7 +74,7 @@ impl Ipv4PacketInterceptor {
         let handle_arc = Arc::new(handle);
 
         // start worker pool
-        let worker_num = self.process_manager.get_available_processor_num() * 2;
+        let worker_num = self.process_manager.get_available_processor_num() + 1;
         let buffer_pool = Arc::new(crossbeam::queue::ArrayQueue::new(worker_num * MAX_BUFFER_COUNT));
         let mut worker_mpsc: HashMap<usize, crossbeam::channel::Sender<(WinDivertNetworkData, Ipv4Packet<Vec<u8>>)>> = HashMap::with_capacity(worker_num);
         for worker_id in 0..worker_num {

@@ -36,8 +36,8 @@ sysinfo = "0.23.5"
 netstat2 = "0.9.1"
 async-speed-limit = "0.4.0"
 local-ip-address = "0.4.4"
-windivert = { git="https://github.com/villcore/windivert-rust", commit= "a3daa1b"}
-windivert-sys = { git="https://github.com/villcore/windivert-rust", commit= "a3daa1b"}
+windivert = { git="https://github.com/villcore/windivert-rust"}
+windivert-sys = { git="https://github.com/villcore/windivert-rust"}
 dns-parser = "0.8.0"
 num_cpus = "1.13.1"
 crossbeam = "0.8.1"
