@@ -484,36 +484,17 @@ impl NetworkModule {
     }
 
     fn default_resolver_config(&self) -> ResolverConfig {
+        let gateway = get_gateway();
         let num_concurrent_reqs = 3;
         let mut name_server_config_group = NameServerConfigGroup::with_capacity(num_concurrent_reqs);
         name_server_config_group.push(
-            NameServerConfig {
-                socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("114.114.114.114").unwrap(), 53)),
-                protocol: Protocol::Udp,
-                tls_dns_name: None,
-                trust_nx_responses: false,
-                bind_addr: None,
-            }
-        );
-
-        name_server_config_group.push(
-            NameServerConfig {
-                socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("223.5.5.5").unwrap(), 53)),
-                protocol: Protocol::Udp,
-                tls_dns_name: None,
-                trust_nx_responses: false,
-                bind_addr: None,
-            }
-        );
-
-        name_server_config_group.push(
-            NameServerConfig {
-                socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("114.114.114.114").unwrap(), 53)),
-                protocol: Protocol::Tcp,
-                tls_dns_name: None,
-                trust_nx_responses: false,
-                bind_addr: None,
-            }
+                NameServerConfig {
+                    socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str(&gateway).unwrap(), 53)),
+                    protocol: Protocol::Udp,
+                    tls_dns_name: None,
+                    trust_nx_responses: false,
+                    bind_addr: None,
+                }
         );
         return config::ResolverConfig::from_parts(None, Vec::new(), name_server_config_group);
     }

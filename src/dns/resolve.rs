@@ -677,4 +677,67 @@ pub async fn resolve_host(async_std_resolver: Arc<AsyncStdResolver>, domain: &st
 
 #[cfg(test)]
 mod tests {
+    use crate::setup_log;
+    use async_std_resolver::config::{NameServerConfigGroup, NameServerConfig, Protocol};
+    use std::net::{SocketAddrV4, Ipv4Addr, SocketAddr};
+    use std::str::FromStr;
+    use async_std_resolver::config;
+    use std::time::Duration;
+    use crate::dns::resolve::resolve_host;
+    use std::sync::Arc;
+
+    #[test]
+    pub fn test_resolve() {
+        setup_log();
+        let run_time = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(run_time) => {
+                run_time
+            }
+            Err(errors) => {
+                log::error!("create runtime error, {}", errors);
+                return;
+            }
+        };
+        run_time.block_on(async {
+            let num_concurrent_reqs = 3;
+            let mut name_server_config_group = NameServerConfigGroup::with_capacity(num_concurrent_reqs);
+            name_server_config_group.push(
+                NameServerConfig {
+                    socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("192.168.50.1").unwrap(), 53)),
+                    protocol: Protocol::Udp,
+                    tls_dns_name: None,
+                    trust_nx_responses: false,
+                    bind_addr: None,
+                }
+            );
+
+            // name_server_config_group.push(
+            //     NameServerConfig {
+            //         socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("223.5.5.5").unwrap(), 53)),
+            //         protocol: Protocol::Udp,
+            //         tls_dns_name: None,
+            //         trust_nx_responses: false,
+            //         bind_addr: None,
+            //     }
+            // );
+            //
+            // name_server_config_group.push(
+            //     NameServerConfig {
+            //         socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_str("114.114.114.114").unwrap(), 53)),
+            //         protocol: Protocol::Tcp,
+            //         tls_dns_name: None,
+            //         trust_nx_responses: false,
+            //         bind_addr: None,
+            //     }
+            // );
+            let resolver_config = config::ResolverConfig::from_parts(None, Vec::new(), name_server_config_group);
+            let mut resolver_opts = config::ResolverOpts::default();
+            resolver_opts.timeout = Duration::from_millis(200);
+            resolver_opts.num_concurrent_reqs = 3;
+            let resolver = async_std_resolver::resolver(resolver_config, resolver_opts).await.expect("failed to connect resolver");
+            let domain = "c27s5.jamjams.net";
+            let ip = resolve_host(Arc::new(resolver), domain).await;
+            log::info!("resolve domain {} => {:?}", domain, ip);
+        });
+    }
 }
