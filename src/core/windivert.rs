@@ -32,6 +32,7 @@ pub struct Ipv4PacketInterceptor {
     pub process_manager: Arc<SystemManager>,
     pub connection_manager: Arc<ActiveConnectionManager>,
     pub host_route_manager: Arc<HostRouteManager>,
+    pub tcp_relay_listen_port: u16,
 }
 
 impl Ipv4PacketInterceptor {
@@ -60,7 +61,7 @@ impl Ipv4PacketInterceptor {
 
         // buffer pool
         let local_host_ip_addr_octets = Ipv4Addr::from_str("127.0.0.1").unwrap().octets();
-        let relay_server_port = 13000u16;
+        let relay_server_port = self.tcp_relay_listen_port;
         let filter = "ip";
         let handle = match WinDivert::new(filter, WinDivertLayer::Network, 0, Default::default()) {
             Ok(handle) => {

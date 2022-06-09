@@ -48,7 +48,7 @@ impl TunServer {
         };
 
         #[cfg(target_os = "macos")]
-            setup_ip_route(&self.tun_name, &self.tun_ip, &self.tun_cidr);
+        setup_ip_route(&self.tun_name, &self.tun_ip, &self.tun_cidr);
 
         #[cfg(target_os = "windows")]
             let mut tun_socket = match tun::windows::TunSocket::new("rproxifier-tun") {
