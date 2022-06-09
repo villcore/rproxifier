@@ -209,15 +209,30 @@ fn main() {
             },
 
             (GET) (/overview/network) => {
-                let app = app_cpy.network_module.clone();
-                let interfaces = app.clone().system_manager.get_network_interface().unwrap_or_else(||vec![]);
-                let network_state = app.clone().dns_config_manager.get_local_dns_state();
-                let bind_dns_interface = &app.clone().bind_network_interface.lock().unwrap().get_copy();
-                rouille::Response::json(&api::NetworkOverview{
-                    interface_list: interfaces,
-                    network_state: network_state,
-                    bind_interface: bind_dns_interface.get_copy()
-                })
+                if cfg!(target_os="windows") {
+                    let dummy_interface = NetworkInterface {
+                        interface_name: "windows环境自动设置为最佳配置".to_string(),
+                        ip_addr: "0.0.0.0".to_string()
+                    };
+
+                    let mut dummy_interfaces = Vec::with_capacity(1);
+                    dummy_interfaces.push(dummy_interface.get_copy());
+                    rouille::Response::json(&api::NetworkOverview{
+                        interface_list: dummy_interfaces,
+                        network_state: true,
+                        bind_interface: dummy_interface
+                    })
+                } else {
+                    let app = app_cpy.network_module.clone();
+                    let interfaces = app.clone().system_manager.get_network_interface().unwrap_or_else(||vec![]);
+                    let network_state = app.clone().dns_config_manager.get_local_dns_state();
+                    let bind_dns_interface = &app.clone().bind_network_interface.lock().unwrap().get_copy();
+                    rouille::Response::json(&api::NetworkOverview{
+                        interface_list: interfaces,
+                        network_state: network_state,
+                        bind_interface: bind_dns_interface.get_copy()
+                    })
+                }
             },
 
             (GET) (/process/get_all_process) => {
@@ -524,7 +539,10 @@ impl NetworkModule {
     }
 
     fn default_resolver_config(&self) -> ResolverConfig {
+        #[cfg(target_os="macos")]
         let gateway = get_gateway();
+        #[cfg(target_os="windows")]
+        let gateway = "192.168.0.1".to_string();
         let num_concurrent_reqs = 3;
         let mut name_server_config_group = NameServerConfigGroup::with_capacity(num_concurrent_reqs);
         name_server_config_group.push(
