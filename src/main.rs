@@ -38,6 +38,8 @@ use crate::dns::server::DnsUdpServer;
 use crate::sys::sys::{DNSSetup, set_rlimit, setup_ip_route};
 #[cfg(target_os = "windows")]
 use crate::sys::sys::DNSSetup;
+#[cfg(target_os = "windows")]
+use crate::core::windivert::{Ipv4PacketInterceptor};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use dns_parser::rdata::Opt;
@@ -47,7 +49,6 @@ use crate::core::host_route_manager::HostRouteManager;
 use crate::core::proxy_config_manager::{HostRouteStrategy, ProxyServerConfigManager, ProxyServerConfig, ProxyServerConfigType, RegexRouteRule, ProcessRegexRouteRule};
 use crate::core::active_connection_manager::ActiveConnectionManager;
 use netstat2::{ProtocolSocketInfo, SocketInfo};
-use crate::core::windivert::{Ipv4PacketInterceptor};
 use crate::sys::sys::get_gateway;
 
 mod dns;
@@ -242,20 +243,23 @@ impl App {
         spawn(move || background_network.run());
         // network.setup_dns();
 
-        let mut network_module = self.network_module.clone();
-        spawn(move || {
-            let ipv4_packet_interceptor = Ipv4PacketInterceptor {
-                session_route_strategy: network_module.session_route_strategy.clone(),
-                nat_session_manager: network_module.nat_session_manager.clone(),
-                fake_ip_manager: network_module.fake_ip_manager.clone(),
-                proxy_config_manager: network_module.proxy_server_config_manager.clone(),
-                process_manager: network_module.system_manager.clone(),
-                connection_manager: network_module.active_connection_manager.clone(),
-                host_route_manager: network_module.host_route_manager.clone()
-            };
+        #[cfg(target_os = "windows")]
+        {
+            let mut network_module = self.network_module.clone();
+            spawn(move || {
+                let ipv4_packet_interceptor = Ipv4PacketInterceptor {
+                    session_route_strategy: network_module.session_route_strategy.clone(),
+                    nat_session_manager: network_module.nat_session_manager.clone(),
+                    fake_ip_manager: network_module.fake_ip_manager.clone(),
+                    proxy_config_manager: network_module.proxy_server_config_manager.clone(),
+                    process_manager: network_module.system_manager.clone(),
+                    connection_manager: network_module.active_connection_manager.clone(),
+                    host_route_manager: network_module.host_route_manager.clone()
+                };
 
-            ipv4_packet_interceptor.run();
-        });
+                ipv4_packet_interceptor.run();
+            });
+        }
     }
 }
 

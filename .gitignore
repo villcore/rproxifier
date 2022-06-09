@@ -1,5 +1,6 @@
 /target
 .idea
+log
 data
 tmp
 Cargo.lock

@@ -13,6 +13,7 @@ pub mod proxy_config_manager;
 pub mod db;
 pub mod host_route_manager;
 pub mod active_connection_manager;
+#[cfg(target_os = "windows")]
 pub mod windivert;
 
 pub struct StreamPipe<S, D> where S: AsyncRead + AsyncWrite, D: AsyncRead + AsyncWrite{
