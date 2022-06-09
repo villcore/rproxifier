@@ -1,2 +1,5 @@
 /target
+.idea
+data
+log
 Cargo.lock
