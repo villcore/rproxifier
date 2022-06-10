@@ -103,18 +103,18 @@ impl DNSSetup {
             let _ = run_cmd("networksetup", &args);
         } else {
             // TODO: windows
-            let output = Command::new("ipconfig")
-                .arg("/flushdns")
-                .output();
-
-            match output {
-                Ok(status) => {
-                    log::info!("flush dns status {}", status.status)
-                }
-                Err(err) => {
-                    log::info!("flush dns status error: {}", err.to_string())
-                }
-            }
+            // let output = Command::new("ipconfig")
+            //     .arg("/flushdns")
+            //     .output();
+            //
+            // match output {
+            //     Ok(status) => {
+            //         log::info!("flush dns status {}", status.status)
+            //     }
+            //     Err(err) => {
+            //         log::info!("flush dns status error: {}", err.to_string())
+            //     }
+            // }
         }
     }
 

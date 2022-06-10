@@ -209,7 +209,7 @@ impl HostRouteManager {
     pub fn is_probe_host_need_proxy(&self, host: &str) -> (bool, bool) {
         return if let Some(kv) = self.probe_proxy_host.get(host) {
             let (need_proxy, last_update_timestamp) = kv.value();
-            let proxy_check_expired = NatSessionManager::get_now_time() - last_update_timestamp > 30 * 60;
+            let proxy_check_expired = NatSessionManager::get_now_time() - last_update_timestamp > 10 * 60;
             (*need_proxy, proxy_check_expired)
         } else {
             (false, true)

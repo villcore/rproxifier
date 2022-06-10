@@ -73,11 +73,15 @@ impl TcpRelayServer {
         log::info!("tun tcp relay server listen on {}:{}", listen_addr.0, listen_addr.1);
         while let Ok((mut tcp_socket, socket_addr)) = tcp_listener.accept().await {
             let buffer_pool = buffer_pool.clone();
-            #[cfg(target_os = "windows")]
-            self.accept_socket_for_windows(tcp_socket, socket_addr, buffer_pool).await;
-            #[cfg(target_os = "macos")]
-            self.accept_socket_for_macos(tcp_socket, socket_addr, buffer_pool).await;
+            self.accept_socket(tcp_socket, socket_addr, buffer_pool).await;
         }
+    }
+
+    async fn accept_socket(&self, mut tcp_socket: TcpStream, socket_addr: SocketAddr, buffer_pool: Arc<crossbeam::queue::ArrayQueue<(BytesMut, BytesMut)>>) {
+        #[cfg(target_os = "windows")]
+        self.accept_socket_for_windows(tcp_socket, socket_addr, buffer_pool).await;
+        #[cfg(target_os = "macos")]
+        self.accept_socket_for_macos(tcp_socket, socket_addr, buffer_pool).await;
     }
 
     async fn accept_socket_for_windows(&self, mut tcp_socket: TcpStream, socket_addr: SocketAddr, buffer_pool: Arc<crossbeam::queue::ArrayQueue<(BytesMut, BytesMut)>>) {
@@ -177,7 +181,7 @@ impl TcpRelayServer {
                             let (dst_socket, direct_connected) = if !already_checked {
                                 let (direct_address, direct_port) = (dst_addr.to_string(), dst_port);
                                 log::info!("Try probe connect to {}:{}", &direct_address, direct_port);
-                                let (dst_socket, direct_connected) = match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(3)).await {
+                                let (dst_socket, direct_connected) = match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(1)).await {
                                     Ok(mut dst_socket) => {
                                         log::info!("Try probe connect succeed");
                                         (Some(dst_socket), true)
@@ -196,7 +200,7 @@ impl TcpRelayServer {
                                 } else {
                                     let (direct_address, direct_port) = (dst_addr.to_string(), dst_port);
                                     log::info!("connect to {}:{}", direct_address, direct_port);
-                                    match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(3)).await {
+                                    match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(1)).await {
                                         Ok(mut dst_socket) => {
                                             (Some(dst_socket), true)
                                         }
@@ -377,7 +381,7 @@ impl TcpRelayServer {
                                         None => (None, false),
                                         Some((direct_address, direct_port)) => {
                                             log::info!("connect to {}:{}", &direct_address, direct_port);
-                                            match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(3)).await {
+                                            match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(1)).await {
                                                 Ok(mut dst_socket) => {
                                                     log::info!("Try probe connect succeed");
                                                     (Some(dst_socket), true)
@@ -402,7 +406,7 @@ impl TcpRelayServer {
                                     };
 
                                     log::info!("connect to {}:{}", direct_address, direct_port);
-                                    match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(3)).await {
+                                    match TcpRelayServer::connect_with_timeout((direct_address, direct_port), Duration::from_secs(1)).await {
                                         Ok(mut dst_socket) => {
                                             (Some(dst_socket), true)
                                         }
@@ -566,7 +570,6 @@ pub mod tests {
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
-    use icmp_socket::IcmpSocket4;
     use crate::{setup_log, TcpRelayServer};
 
     #[test]
@@ -587,7 +590,7 @@ pub mod tests {
         };
         run_time.block_on(async {
             log::info!("a");
-            let a = TcpRelayServer::connect_with_timeout(("static.xx.fbcdn.net", 443), Duration::from_secs(3)).await.unwrap();
+            let a = TcpRelayServer::connect_with_timeout(("static.xx.fbcdn.net", 443), Duration::from_secs(1)).await.unwrap();
             log::info!("connect result = {:?}", a);
             log::info!("b")
         });

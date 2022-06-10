@@ -1,9 +1,10 @@
+use std::arch::x86_64::_mm_add_ps;
 use std::collections::{HashMap, HashSet, LinkedList};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use crate::dns::resolve::FakeIpManager;
 use windivert::*;
-use std::process::exit;
+use std::process::{Command, exit};
 use std::str::FromStr;
 use std::sync::mpsc::{channel, Sender, sync_channel, SyncSender};
 use std::thread::sleep;
@@ -15,6 +16,7 @@ use smoltcp::Error;
 use dns_parser::rdata::A;
 use libc::sockaddr;
 use rouille::url::quirks::host;
+use serde::de::Unexpected::Option;
 use windivert::address::WinDivertNetworkData;
 use crate::{ActiveConnectionManager, HostRouteManager, HostRouteStrategy, NatSessionManager, ProcessInfo, ProxyServerConfigManager, ProxyServerConfigType, SystemManager, TcpRelayServer};
 use crate::core::active_connection_manager::ConnectionTransferType;
@@ -37,7 +39,9 @@ pub struct Ipv4PacketInterceptor {
 
 impl Ipv4PacketInterceptor {
     pub fn run(&self) {
-        let pid = std::process::id();
+        // load cached dns
+        self.load_cached_dns();
+
         // start connection monitor
         let connection_manager = self.connection_manager.clone();
         let process_manager = self.process_manager.clone();
@@ -59,7 +63,6 @@ impl Ipv4PacketInterceptor {
             }
         });
 
-        // buffer pool
         let local_host_ip_addr_octets = Ipv4Addr::from_str("127.0.0.1").unwrap().octets();
         let relay_server_port = self.tcp_relay_listen_port;
         let filter = "ip";
@@ -91,6 +94,8 @@ impl Ipv4PacketInterceptor {
             };
 
             // start thread
+            let pid = std::process::id();
+            let allowed_skip_tcp_relay = true;
             let handle = handle_arc.clone();
             let fake_ip_manager = self.fake_ip_manager.clone();
             let nat_session_manager = self.nat_session_manager.clone();
@@ -139,7 +144,6 @@ impl Ipv4PacketInterceptor {
                                             Some(host) => host
                                         };
                                         if !connection_manager.contains_connection(src_port) {
-                                            // log::info!("udp outbound, {} -> {}:{} => {}:{}", &host, src_addr, src_port, dst_addr, dst_port);
                                             let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
                                                 let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
                                                 let process_info = process_manager.get_process(pid)
@@ -167,7 +171,6 @@ impl Ipv4PacketInterceptor {
 
                                         let mut data = ipv4_packet.into_inner();
                                         connection_manager.incr_tx(src_port, data.len());
-                                        // handle.send(WinDivertParsedPacket::Network { addr, data });
                                         handle.send_with_buffer(addr.data.into_owned(), &mut data);
                                         recycle_buffer_handler(data);
                                         continue;
@@ -242,27 +245,8 @@ impl Ipv4PacketInterceptor {
                                             Some(host) => host
                                         };
 
-                                        // if proxy_server_host_set.contains(&host) {
-                                        //     let mut data = ipv4_packet.into_inner();
-                                        //     handle.send_with_buffer(addr.data.into_owned(), &mut data);
-                                        //     recycle_buffer_handler(data);
-                                        //     continue;
-                                        // }
-
-                                        // let seq_number = tcp_packet.seq_number();
                                         if tcp_packet.syn() {
                                             if src_port != relay_server_port {
-                                                // log::info!("------- new tcp pipe {} -> {}:{} -> {}:{} -> seq_num {}", &host, src_addr, src_port, dst_addr, dst_port, seq_number);
-                                                // if let Some(proxy_server_config_vec) = proxy_config_manager.get_all_proxy_server_config() {
-                                                //     for proxy_server_config in proxy_server_config_vec {
-                                                //         match proxy_server_config.config {
-                                                //             ProxyServerConfigType::SocksV5(addr, _, _, _) => {
-                                                //                 proxy_server_host_set.insert(addr);
-                                                //             }
-                                                //             _ => {}
-                                                //         }
-                                                //     }
-                                                // }
                                                 let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
                                                     let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
                                                     let process_info = process_manager.get_process(pid).unwrap_or_else(|| ProcessInfo::default());
@@ -279,7 +263,6 @@ impl Ipv4PacketInterceptor {
                                                         strategy
                                                     }
                                                 };
-                                                // log::info!(" open transfer {}:{} -> {}:{} -> {:?}", src_addr, src_port, dst_addr, dst_port, host_route_strategy);
                                                 host_route_strategy_map.insert(src_port, (host_route_strategy, process_info.get_copy()));
                                                 TcpRelayServer::add_active_connection(src_port, src_addr, src_port, dst_port, &connection_manager,
                                                                                       connection_route_rule, ConnectionTransferType::TCP, Some(process_info), &(host, src_port),
@@ -287,7 +270,6 @@ impl Ipv4PacketInterceptor {
                                             }
                                         } else if tcp_packet.fin() {
                                             if src_port != relay_server_port {
-                                                // log::info!("======= close tcp pipe {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
                                                 connection_manager.remove_connection(src_port);
                                             }
                                         }
@@ -322,20 +304,24 @@ impl Ipv4PacketInterceptor {
                                                 continue;
                                             }
                                             HostRouteStrategy::Probe(already_checked, need_proxy, proxy_config_name, direct_ip, last_update_time) => {
-                                                if *already_checked && !*need_proxy {
-                                                    let mut data = ipv4_packet.into_inner();
+                                                if allowed_skip_tcp_relay {
+                                                    if *already_checked && !*need_proxy {
+                                                        let mut data = ipv4_packet.into_inner();
                                                         connection_manager.incr_tx(src_port, data.len());
                                                         handle.send_with_buffer(addr.data.into_owned(), &mut data);
                                                         recycle_buffer_handler(data);
                                                         continue;
+                                                    }
                                                 }
                                             }
-                                            _ => {
-                                                let mut data = ipv4_packet.into_inner();
-                                                connection_manager.incr_tx(src_port, data.len());
-                                                handle.send_with_buffer(addr.data.into_owned(), &mut data);
-                                                recycle_buffer_handler(data);
-                                                continue;
+                                            HostRouteStrategy::Direct => {
+                                                if allowed_skip_tcp_relay {
+                                                    let mut data = ipv4_packet.into_inner();
+                                                    connection_manager.incr_tx(src_port, data.len());
+                                                    handle.send_with_buffer(addr.data.into_owned(), &mut data);
+                                                    recycle_buffer_handler(data);
+                                                    continue;
+                                                }
                                             }
                                         }
 
@@ -366,7 +352,6 @@ impl Ipv4PacketInterceptor {
                                             ipv4_packet.set_src_addr(new_src_addr.into());
                                             ipv4_packet.set_dst_addr(new_dst_addr.into());
                                             ipv4_packet.fill_checksum();
-                                            // log::info!("Relay server Send new >>>>>>>>>>>>>>>>>>>>>>>>>>>>>> {}:{} -> {}:{} / origin {}:{} -> {}:{} -> seq {}", new_src_addr, new_src_port, new_dst_addr, new_dst_port, src_addr, src_port, dst_addr, dst_port, seq_number);
                                             let mut data = ipv4_packet.into_inner();
                                             connection_manager.incr_rx(new_dst_port, data.len());
                                             handle.send_with_buffer(addr.data.into_owned(), &mut data);
@@ -401,7 +386,6 @@ impl Ipv4PacketInterceptor {
                                                 session_route_strategy.insert(port, host_route_strategy.get_copy());
                                             }
 
-                                            // TODO: copy data;
                                             let new_src_addr = dst_addr;
                                             let new_src_port = port;
                                             let new_dst_addr = src_addr;
@@ -523,33 +507,74 @@ impl Ipv4PacketInterceptor {
             }
         }
     }
+
+    fn load_cached_dns(&self) {
+        let fake_ip_manager = self.fake_ip_manager.clone();
+        for (host, ip_vec) in  self.get_cached_dns() {
+            for ip in ip_vec {
+                let octets = ip.octets();
+                log::info!("set fake_ip {}:{}", host, ip);
+                fake_ip_manager.set_host_ip(&host, (octets[0], octets[1], octets[2], octets[3]));
+            }
+        }
+    }
+
+    pub fn get_cached_dns(&self) -> Vec<(String, Vec<Ipv4Addr>)> {
+        let mut cached_dns = Vec::with_capacity(512);
+        let dns_helper_cmd = "dns_helper.exe";
+        let cmd_output = match Command::new(dns_helper_cmd).output() {
+            Ok(cmd_out) => cmd_out,
+            Err(_errors) => return cached_dns
+        };
+
+        let stdout_str = String::from_utf8_lossy(&cmd_output.stdout);
+        let dns_a_record_lines = stdout_str.lines();
+        for dns_a_record in dns_a_record_lines {
+            let host_port = dns_a_record.to_string() + ":80";
+            let socket_addr_vec: Vec<Ipv4Addr> = host_port.to_socket_addrs()
+                .map_or(Vec::new().into_iter(), |v| v)
+                .map(|socket_addr| socket_addr.ip())
+                .map(|ip| match ip {
+                    IpAddr::V4(addr) => Some(addr),
+                    IpAddr::V6(_) => None
+                })
+                .filter(|opt| opt.is_some())
+                .map(|opt| opt.unwrap())
+                .collect();
+
+            if !socket_addr_vec.is_empty() {
+                cached_dns.push((dns_a_record.to_string(), socket_addr_vec));
+            }
+        }
+        cached_dns
+    }
 }
 
 pub fn update_fake_ip_dns(fake_ip_manager: Arc<FakeIpManager>, dns_packet: dns_parser::Packet) {
-    let header = dns_packet.header;
-    if header.query {
-        return;
-    }
+        let header = dns_packet.header;
+        if header.query {
+            return;
+        }
 
-    if header.questions <= 0 || header.answers <= 0 {
-        return;
-    }
+        if header.questions <= 0 || header.answers <= 0 {
+            return;
+        }
 
-    let question = dns_packet.questions.get(0).unwrap();
-    let host = format!("{}", question.qname);
+        let question = dns_packet.questions.get(0).unwrap();
+        let host = format!("{}", question.qname);
 
-    for answer in dns_packet.answers {
-        let rdata = answer.data;
-        match rdata {
-            RData::A(record) => {
-                let ip = record.0;
-                let ip_bytes = ip.octets();
-                let ip_tuple = (ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-                log::info!("set fake_ip {}:{}", host.to_string(), ip);
-                fake_ip_manager.set_host_ip(&host, ip_tuple);
-                break;
+        for answer in dns_packet.answers {
+            let rdata = answer.data;
+            match rdata {
+                RData::A(record) => {
+                    let ip = record.0;
+                    let ip_bytes = ip.octets();
+                    let ip_tuple = (ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                    log::info!("set fake_ip {}:{}", host.to_string(), ip);
+                    fake_ip_manager.set_host_ip(&host, ip_tuple);
+                    break;
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
-}
