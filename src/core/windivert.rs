@@ -95,7 +95,7 @@ impl Ipv4PacketInterceptor {
 
             // start thread
             let pid = std::process::id();
-            let allowed_skip_tcp_relay = true;
+            let allowed_skip_tcp_relay = false;
             let handle = handle_arc.clone();
             let fake_ip_manager = self.fake_ip_manager.clone();
             let nat_session_manager = self.nat_session_manager.clone();
