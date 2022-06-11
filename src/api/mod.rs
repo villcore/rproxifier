@@ -52,7 +52,6 @@ pub struct GetDnsConfigRequest {
     pub host: String,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetDnsConfigResponse {
     pub local_dns_server: String,
