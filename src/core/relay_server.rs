@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use async_std_resolver::AsyncStdResolver;
 use crate::dns::resolve::{FakeIpManager, resolve_host};
@@ -574,34 +575,42 @@ pub struct UdpRelayServer {
     pub proxy_server_config_manager: Arc<ProxyServerConfigManager>,
     pub active_connection_manager: Arc<ActiveConnectionManager>,
     pub process_manager: Arc<SystemManager>,
-    pub dns_config_manager: Arc<DnsConfigManager>,
-    pub listen_addr: (u8, u8, u8, u8),
-    pub listen_port: u16,
+    // pub dns_config_manager: Arc<DnsConfigManager>,
+    // pub listen_addr: (u8, u8, u8, u8),
+    // pub listen_port: u16,
 }
 
 impl UdpRelayServer {
     pub async fn run(&self) {
-
         let session_manager = self.nat_session_manager.clone();
-
+        let session_udp_socket = Arc::new(DashMap::<u16, Arc<UdpSocket>>::new());
         let mut buf = vec![0; 2000];
-        let udp_listen_socket = Arc::new(UdpSocket::bind("0.0.0.0:1300").await.unwrap());
+        let udp_listen_socket = Arc::new(UdpSocket::bind("0.0.0.0:12000").await.unwrap());
         loop {
             let (recv_size, addr) = udp_listen_socket.recv_from(&mut buf).await.unwrap();
             let session_port = addr.port();
             let (src_addr, src_port, dst_addr, dst_port) = session_manager.lock().unwrap().get_port_session_tuple(session_port).unwrap();
             log::info!(">>>>>>>>>>>>>recv udp packet. {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
+            let remote_udp_socket = match session_udp_socket.get(&session_port) {
+                Some(kv) => kv.value().clone(),
+                None => {
+                    let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+                    udp_socket.connect((dst_addr.to_string(), dst_port)).await.unwrap();
+                    let local_udp_socket = udp_listen_socket.clone();
+                    let remote_udp_socket = udp_socket.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let mut buf = vec![0; 2000];
+                            let (recv_size, remote_recv_addr) = remote_udp_socket.recv_from(&mut buf).await.unwrap();
+                            local_udp_socket.send_to(&buf[..recv_size], addr).await;
+                        }
+                    });
 
-            let local_udp_socket = udp_listen_socket.clone();
-            tokio::spawn(async move {
-                let remove_udp_socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-                loop {
-                    let mut buf = vec![0; 2000];
-                    let (recv_size, addr) = remove_udp_socket.recv_from(&mut buf).await.unwrap();
-                    local_udp_socket.send_to(&buf[..recv_size], addr).await;
+                    session_udp_socket.insert(session_port, udp_socket.clone());
+                    udp_socket
                 }
-            });
-            udp_listen_socket.send_to(&buf[..recv_size], (dst_addr.to_string(), dst_port)).await;
+            };
+            remote_udp_socket.send_to(&buf[..recv_size], (dst_addr.to_string(), dst_port)).await;
         }
     }
 }

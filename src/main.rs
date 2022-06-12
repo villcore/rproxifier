@@ -29,7 +29,7 @@ use tun::darwin::TunSocket;
 
 use crate::core::dns_manager::{DnsManager, DnsConfigManager, DnsHost};
 use crate::core::nat_session::NatSessionManager;
-use crate::core::relay_server::TcpRelayServer;
+use crate::core::relay_server::{TcpRelayServer, UdpRelayServer};
 use crate::core::tun_server::TunServer;
 use crate::dns::protocol::{DnsPacket, DnsRecord, QueryType, TransientTtl};
 use crate::dns::resolve::{ConfigDnsResolver, DirectDnsResolver, DnsResolver, FakeIpManager, ForwardingDnsResolver, resolve_host, UserConfigDnsResolver};
@@ -483,6 +483,26 @@ impl NetworkModule {
             #[cfg(target_os = "macos")]
             dns_server.run_dns_server();
             log::info!("start run dns sever complete");
+
+            // udp_relay_server
+            let udp_relay_server = UdpRelayServer {
+                resolver: Arc::new(resolver.clone()),
+                fake_ip_manager: fake_ip_manager.clone(),
+                nat_session_manager: nat_session_manager.clone(),
+                host_route_manager: host_route_manager.clone(),
+                session_route_strategy: session_route_strategy.clone(),
+                active_connection_manager: active_connection_manager.clone(),
+                proxy_server_config_manager: proxy_server_config_manager.clone(),
+                // listen_addr: (tcp_relay_listen_port_octets[0], tcp_relay_listen_port_octets[1], tcp_relay_listen_port_octets[2], tcp_relay_listen_port_octets[3]),
+                // listen_port: tcp_relay_listen_port,
+                process_manager: process_manager.clone(),
+            };
+
+            log::info!("start udp relay sever");
+            tokio::spawn(async move {
+                udp_relay_server.run().await
+            });
+            log::info!("start udp relay sever complete");
 
             let tcp_relay_listen_port = self.tcp_relay_listen_port;
             let tcp_relay_listen_port_octets = Ipv4Addr::from_str(&self.tcp_relay_listen_addr).unwrap().octets();
