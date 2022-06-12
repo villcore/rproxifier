@@ -565,6 +565,47 @@ impl TcpRelayServer {
     }
 }
 
+pub struct UdpRelayServer {
+    pub resolver: Arc<AsyncStdResolver>,
+    pub fake_ip_manager: Arc<FakeIpManager>,
+    pub nat_session_manager: Arc<Mutex<NatSessionManager>>,
+    pub host_route_manager: Arc<HostRouteManager>,
+    pub session_route_strategy: Arc<DashMap<u16, HostRouteStrategy>>,
+    pub proxy_server_config_manager: Arc<ProxyServerConfigManager>,
+    pub active_connection_manager: Arc<ActiveConnectionManager>,
+    pub process_manager: Arc<SystemManager>,
+    pub dns_config_manager: Arc<DnsConfigManager>,
+    pub listen_addr: (u8, u8, u8, u8),
+    pub listen_port: u16,
+}
+
+impl UdpRelayServer {
+    pub async fn run(&self) {
+
+        let session_manager = self.nat_session_manager.clone();
+
+        let mut buf = vec![0; 2000];
+        let udp_listen_socket = Arc::new(UdpSocket::bind("0.0.0.0:1300").await.unwrap());
+        loop {
+            let (recv_size, addr) = udp_listen_socket.recv_from(&mut buf).await.unwrap();
+            let session_port = addr.port();
+            let (src_addr, src_port, dst_addr, dst_port) = session_manager.lock().unwrap().get_port_session_tuple(session_port).unwrap();
+            log::info!(">>>>>>>>>>>>>recv udp packet. {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
+
+            let local_udp_socket = udp_listen_socket.clone();
+            tokio::spawn(async move {
+                let remove_udp_socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+                loop {
+                    let mut buf = vec![0; 2000];
+                    let (recv_size, addr) = remove_udp_socket.recv_from(&mut buf).await.unwrap();
+                    local_udp_socket.send_to(&buf[..recv_size], addr).await;
+                }
+            });
+            udp_listen_socket.send_to(&buf[..recv_size], (dst_addr.to_string(), dst_port)).await;
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use std::future::Future;
