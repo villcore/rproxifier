@@ -215,26 +215,26 @@ impl Ipv4PacketInterceptor {
                                     let src_port = udp_packet.src_port();
                                     let dst_port = udp_packet.dst_port();
 
+                                    // log::info!("UDP [{}]:[{}] => [{}]:[{}] => outbound {}", src_addr, src_port, dst_addr, dst_port, outbound);
                                     if outbound {
                                         let fake_ip_manager = fake_ip_manager.clone();
                                         let host = match fake_ip_manager.get_host(&(dst_addr_octets[0], dst_addr_octets[1], dst_addr_octets[2], dst_addr_octets[3])) {
                                             None => {
-                                                let mut data = ipv4_packet.into_inner();
-                                                handle.send_with_buffer(addr, &mut data);
-                                                recycle_buffer_handler(data);
-                                                continue;
+                                                let dst_host = dst_addr.to_string();
+                                                fake_ip_manager.set_host_ip(&dst_host, (dst_addr_octets[0], dst_addr_octets[1], dst_addr_octets[2], dst_addr_octets[3]));
+                                                dst_host
                                             }
                                             Some(host) => host
                                         };
+                                        let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
+                                            let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
+                                            let process_info = process_manager.get_process(pid)
+                                                .unwrap_or_else(|| ProcessInfo::default());
+                                            Some(process_info)
+                                        } else {
+                                            Some(ProcessInfo::default())
+                                        }.unwrap();
                                         if !connection_manager.contains_connection(src_port) {
-                                            let process_info = if let Some(socket_info) = process_manager.get_process_by_port(src_port) {
-                                                let pid = *socket_info.associated_pids.get(0).unwrap_or_else(|| &0);
-                                                let process_info = process_manager.get_process(pid)
-                                                    .unwrap_or_else(|| ProcessInfo::default());
-                                                Some(process_info)
-                                            } else {
-                                                Some(ProcessInfo::default())
-                                            }.unwrap();
                                             // log::info!("process_info = {:?}", process_info);
                                             let mut connection_route_rule = ConnectionRouteRule::new();
                                             let host_route_manager = host_route_manager.clone();
@@ -248,15 +248,92 @@ impl Ipv4PacketInterceptor {
 
                                             host_route_strategy_map.insert(src_port, (host_route_strategy, process_info.get_copy()));
                                             TcpRelayServer::add_active_connection(src_port, src_addr, src_port, dst_port, &connection_manager,
-                                                                                  connection_route_rule, ConnectionTransferType::UDP, Some(process_info), &(host, src_port),
+                                                                                  connection_route_rule, ConnectionTransferType::UDP, Some(process_info.get_copy()), &(host, src_port),
                                             );
                                         }
 
-                                        let mut data = ipv4_packet.into_inner();
-                                        connection_manager.incr_tx(src_port, data.len());
-                                        handle.send_with_buffer(addr, &mut data);
-                                        recycle_buffer_handler(data);
-                                        continue;
+                                        // relay to local
+                                        let relay_server_port = 12000u16;
+                                        if src_port == relay_server_port {
+                                            let mut nat_session_manager = nat_session_manager.lock().unwrap();
+                                            let (origin_src_addr, origin_src_port, origin_dst_addr, origin_dst_port) = match nat_session_manager.get_port_session_tuple(dst_port) {
+                                                None => {
+                                                    let mut data = ipv4_packet.into_inner();
+                                                    handle.send_with_buffer(addr, &mut data);
+                                                    recycle_buffer_handler(data);
+                                                    continue;
+                                                }
+                                                Some((origin_src_addr, origin_src_port, origin_dst_addr, origin_dst_port)) => {
+                                                    (origin_src_addr, origin_src_port, origin_dst_addr, origin_dst_port)
+                                                }
+                                            };
+
+                                            let new_src_addr = origin_dst_addr;
+                                            let new_src_port = origin_dst_port;
+                                            let new_dst_addr = origin_src_addr;
+                                            let new_dst_port = origin_src_port;
+
+                                            udp_packet.set_src_port(new_src_port);
+                                            udp_packet.set_dst_port(new_dst_port);
+                                            udp_packet.fill_checksum(&new_src_addr.into(), &new_dst_addr.into());
+                                            ipv4_packet.set_src_addr(new_src_addr.into());
+                                            ipv4_packet.set_dst_addr(new_dst_addr.into());
+                                            ipv4_packet.fill_checksum();
+                                            let mut data = ipv4_packet.into_inner();
+                                            connection_manager.incr_rx(new_dst_port, data.len());
+                                            handle.send_with_buffer(addr, &mut data);
+                                            recycle_buffer_handler(data);
+                                            continue;
+                                        } else {
+                                            if process_info.pid == pid {
+                                                let mut data = ipv4_packet.into_inner();
+                                                handle.send_with_buffer(addr, &mut data);
+                                                recycle_buffer_handler(data);
+                                                continue;
+                                            }
+
+                                            // modify udp packet
+                                            let nat_session_manager = nat_session_manager.clone();
+                                            let mut nat_session_manager = match nat_session_manager.lock() {
+                                                Ok(nat_session_manager) => {
+                                                    nat_session_manager
+                                                }
+
+                                                Err(errors) => {
+                                                    log::error!("get nat session manager lock error");
+                                                    let mut data = ipv4_packet.into_inner();
+                                                    handle.send_with_buffer(addr, &mut data);
+                                                    recycle_buffer_handler(data);
+                                                    continue;
+                                                }
+                                            };
+                                            let port = match nat_session_manager.get_session_port((src_addr, src_port, dst_addr, dst_port)) {
+                                                None => {
+                                                    let mut data = ipv4_packet.into_inner();
+                                                    handle.send_with_buffer(addr, &mut data);
+                                                    recycle_buffer_handler(data);
+                                                    continue;
+                                                }
+                                                Some(port) => port
+                                            };
+
+                                            let new_src_addr = dst_addr;
+                                            let new_src_port = port;
+                                            let new_dst_addr = src_addr;
+                                            let new_dst_port = relay_server_port;
+
+                                            udp_packet.set_src_port(new_src_port);
+                                            udp_packet.set_dst_port(new_dst_port);
+                                            udp_packet.fill_checksum(&new_src_addr.into(), &new_dst_addr.into());
+                                            ipv4_packet.set_src_addr(new_src_addr.into());
+                                            ipv4_packet.set_dst_addr(new_dst_addr.into());
+                                            ipv4_packet.fill_checksum();
+                                            let mut data = ipv4_packet.into_inner();
+                                            connection_manager.incr_tx(src_port, data.len());
+                                            handle.send_with_buffer(addr, &mut data);
+                                            recycle_buffer_handler(data);
+                                            continue;
+                                        }
                                     } else {
                                         // inbound
                                         if udp_packet.src_port() != 53 {
@@ -596,30 +673,30 @@ impl Ipv4PacketInterceptor {
 }
 
 pub fn update_fake_ip_dns(fake_ip_manager: Arc<FakeIpManager>, dns_packet: dns_parser::Packet) {
-        let header = dns_packet.header;
-        if header.query {
-            return;
-        }
+    let header = dns_packet.header;
+    if header.query {
+        return;
+    }
 
-        if header.questions <= 0 || header.answers <= 0 {
-            return;
-        }
+    if header.questions <= 0 || header.answers <= 0 {
+        return;
+    }
 
-        let question = dns_packet.questions.get(0).unwrap();
-        let host = format!("{}", question.qname);
+    let question = dns_packet.questions.get(0).unwrap();
+    let host = format!("{}", question.qname);
 
-        for answer in dns_packet.answers {
-            let rdata = answer.data;
-            match rdata {
-                RData::A(record) => {
-                    let ip = record.0;
-                    let ip_bytes = ip.octets();
-                    let ip_tuple = (ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-                    log::info!("set fake_ip {}:{}", host.to_string(), ip);
-                    fake_ip_manager.set_host_ip(&host, ip_tuple);
-                    break;
-                }
-                _ => {}
+    for answer in dns_packet.answers {
+        let rdata = answer.data;
+        match rdata {
+            RData::A(record) => {
+                let ip = record.0;
+                let ip_bytes = ip.octets();
+                let ip_tuple = (ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                log::info!("set fake_ip {}:{}", host.to_string(), ip);
+                fake_ip_manager.set_host_ip(&host, ip_tuple);
+                break;
             }
+            _ => {}
         }
     }
+}
