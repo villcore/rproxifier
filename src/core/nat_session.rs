@@ -85,15 +85,12 @@ pub struct InnerNatSessionManager {
 
 impl InnerNatSessionManager {
     pub fn next_port(&mut self) -> u16 {
-        log::info!("current recycle port queue count {}", self.recycle_port_list.len());
         return match self.get_recycle_port() {
             None => {
                 let port = self.calculate_next_port();
-                log::info!("get new calculate next port {}", port);
                 port
             }
             Some(port) => {
-                log::info!("get available recycle port {}", port);
                 port
             }
         };

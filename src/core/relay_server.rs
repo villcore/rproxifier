@@ -584,32 +584,55 @@ impl UdpRelayServer {
     pub async fn run(&self) {
         let session_manager = self.nat_session_manager.clone();
         let session_udp_socket = Arc::new(DashMap::<u16, Arc<UdpSocket>>::new());
-        let mut buf = vec![0; 2000];
+        let mut buf = vec![0; 2 * 1024];
         let udp_listen_socket = Arc::new(UdpSocket::bind("0.0.0.0:12000").await.unwrap());
         loop {
             let (recv_size, addr) = udp_listen_socket.recv_from(&mut buf).await.unwrap();
             let session_port = addr.port();
             let (src_addr, src_port, dst_addr, dst_port) = session_manager.lock().unwrap().get_port_session_tuple(session_port).unwrap();
-            log::info!(">>>>>>>>>>>>>recv udp packet. {}:{} -> {}:{}", src_addr, src_port, dst_addr, dst_port);
             let remote_udp_socket = match session_udp_socket.get(&session_port) {
                 Some(kv) => kv.value().clone(),
                 None => {
                     let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
-                    udp_socket.connect((dst_addr.to_string(), dst_port)).await.unwrap();
                     let local_udp_socket = udp_listen_socket.clone();
                     let remote_udp_socket = udp_socket.clone();
+                    let inner_session_udp_socket = session_udp_socket.clone();
                     tokio::spawn(async move {
+                        let mut buf = vec![0; 2 * 1024];
                         loop {
-                            let mut buf = vec![0; 2000];
-                            let (recv_size, remote_recv_addr) = remote_udp_socket.recv_from(&mut buf).await.unwrap();
-                            local_udp_socket.send_to(&buf[..recv_size], addr).await;
-                        }
-                    });
+                            tokio::select! {
+                              // handle src to dst pipe
+                               recv_result = remote_udp_socket.recv_from(&mut buf) => {
+                                let recv_size = match recv_result {
+                                  Ok((recv_size, recv_socket_addr)) => recv_size,
+                                  Err(errors) => break
+                                };
 
+                                if recv_size <= 0 {
+                                    break;
+                                }
+
+                                match local_udp_socket.send_to(&buf[..recv_size], addr).await {
+                                  Ok(_) => {},
+                                  Err(errors) => {
+                                     break
+                                  }
+                                }
+                              },
+
+                              _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                                break;
+                              }
+                            }
+                        }
+                        inner_session_udp_socket.remove(&session_port);
+                    });
                     session_udp_socket.insert(session_port, udp_socket.clone());
                     udp_socket
                 }
             };
+
+            // TODO: set src_pid.
             remote_udp_socket.send_to(&buf[..recv_size], (dst_addr.to_string(), dst_port)).await;
         }
     }
